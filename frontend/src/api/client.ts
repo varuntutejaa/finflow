@@ -31,10 +31,23 @@ export interface Transaction {
   toAccountId: string
   toAccountName: string
   toUsername: string
+  category: string
   amount: number
   status: 'completed' | 'failed'
   failureReason: string | null
   createdAt: string
+}
+
+export interface BudgetSummary {
+  id: string
+  category: string
+  monthlyLimit: number
+  spent: number
+  remaining: number
+  utilizationPercent: number
+  thresholdPercent: number
+  status: 'healthy' | 'warning' | 'exceeded'
+  monthKey: string
 }
 
 export interface ApiError {
@@ -42,7 +55,7 @@ export interface ApiError {
   message: string
 }
 
-const BASE_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:3000'
+const BASE_URL = import.meta.env.VITE_API_URL ?? ''
 const TOKEN_STORAGE_KEY = 'finflow_token'
 
 export function getToken(): string | null {
@@ -67,7 +80,17 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       ...init?.headers,
     },
   })
-  const body = await res.json()
+  const contentType = res.headers.get('content-type') ?? ''
+  const isJson = contentType.includes('application/json')
+  const body = isJson ? await res.json() : await res.text()
+
+  if (!isJson) {
+    const preview = typeof body === 'string' ? body.slice(0, 48).replace(/\s+/g, ' ') : ''
+    throw new Error(
+      `Non-JSON response from ${BASE_URL || 'current origin'}${path}${preview ? ` (${preview}...)` : ''}`
+    )
+  }
+
   if (!res.ok) {
     const error: ApiError = body.error ?? { code: 'UNKNOWN', message: 'Request failed' }
     const err = new Error(error.message) as Error & { code: string; transaction?: Transaction }
@@ -126,12 +149,52 @@ export function fetchTransactions(accountId?: string): Promise<Transaction[]> {
   return request(`/api/transactions${qs}`)
 }
 
+export function fetchBudgets(): Promise<{ categories: string[]; budgets: BudgetSummary[] }> {
+  return request('/api/budgets')
+}
+
+export function saveBudgets(input: {
+  budgets: Array<{ category: string; monthlyLimit: number; thresholdPercent?: number }>
+}): Promise<{ categories: string[]; budgets: BudgetSummary[] }> {
+  return request('/api/budgets', {
+    method: 'PUT',
+    body: JSON.stringify(input),
+  })
+}
+
+export function deleteBudgetCategory(category: string): Promise<{ categories: string[]; budgets: BudgetSummary[] }> {
+  return request(`/api/budgets/${encodeURIComponent(category)}`, {
+    method: 'DELETE',
+  })
+}
+
+export function selfTransfer(input: {
+  fromAccountId: string
+  toAccountId: string
+  amount: number
+  idempotencyKey: string
+  pin: string
+}): Promise<{ transaction: Transaction; replayed: boolean; accounts: Account[] }> {
+  return request('/api/transactions/self-transfer', {
+    method: 'POST',
+    body: JSON.stringify(input),
+  })
+}
+
+export function updateTransactionCategory(transactionId: string, category: string): Promise<Transaction> {
+  return request(`/api/transactions/${encodeURIComponent(transactionId)}/category`, {
+    method: 'PATCH',
+    body: JSON.stringify({ category }),
+  })
+}
+
 export function transfer(input: {
   fromAccountId: string
   toUsername: string
   amount: number
   idempotencyKey: string
   pin: string
+  category: string
 }): Promise<{ transaction: Transaction; replayed: boolean; accounts: Account[] }> {
   return request('/api/transactions/transfer', {
     method: 'POST',
@@ -142,6 +205,8 @@ export function transfer(input: {
 // Money is stored server-side as an integer count of the currency's minor unit
 // (paise for INR). These convert to/from the whole-rupee value shown to users.
 export const MAX_TRANSFER_AMOUNT_PAISE = 50000000
+export const BUDGET_CATEGORIES = ['food', 'transport', 'shopping', 'bills'] as const
+export type BudgetCategory = (typeof BUDGET_CATEGORIES)[number]
 
 export function rupeesToPaise(value: string): number {
   const parsed = Number(value)

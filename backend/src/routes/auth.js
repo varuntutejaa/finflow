@@ -7,7 +7,7 @@ import {
   getUserRawById,
   setUserPin,
 } from "../config/database.js";
-import { hashPassword, verifyPassword, signToken, requireAuth } from "../services/auth.js";
+import { hashPassword, verifyPassword, signToken, requireAuth, checkPinAuthorization } from "../services/auth.js";
 
 const router = Router();
 
@@ -123,14 +123,9 @@ router.post("/verify-pin", requireAuth, (req, res) => {
   const { pin } = req.body ?? {};
   const user = getUserRawById(req.userId);
 
-  if (!user.upi_pin_hash) {
-    return res.status(403).json({ error: { code: "PIN_NOT_SET", message: "No UPI PIN set for this account" } });
-  }
-  if (typeof pin !== "string" || !PIN_RE.test(pin)) {
-    return res.status(400).json({ error: { code: "INVALID_PIN", message: "UPI PIN must be exactly 4 digits" } });
-  }
-  if (!verifyPassword(pin, user.upi_pin_hash)) {
-    return res.status(401).json({ error: { code: "INCORRECT_PIN", message: "Incorrect UPI PIN" } });
+  const authError = checkPinAuthorization(user, pin);
+  if (authError) {
+    return res.status(authError.status).json({ error: { code: authError.code, message: authError.message } });
   }
   res.json({ valid: true });
 });

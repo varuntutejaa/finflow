@@ -21,11 +21,11 @@ export function PinModal({ title, subtitle, onConfirm, onCancel }: Props) {
     return () => document.removeEventListener('keydown', handleKey)
   }, [onCancel, submitting])
 
-  const attemptSubmit = (candidate: string) => {
-    if (candidate.length !== 4 || submitting) return
+  const handlePay = () => {
+    if (pin.length !== 4 || submitting) return
     setSubmitting(true)
     setError(null)
-    onConfirm(candidate)
+    onConfirm(pin)
       .catch((err) => {
         setError(err instanceof Error ? err.message : 'Transfer failed')
         setPin('')
@@ -53,14 +53,22 @@ export function PinModal({ title, subtitle, onConfirm, onCancel }: Props) {
           onChange={(v) => {
             setError(null)
             setPin(v)
-            attemptSubmit(v)
           }}
           autoFocus
         />
 
         <p className="pin-modal-status" aria-live="polite">
-          {submitting ? 'Verifying…' : error ?? ' '}
+          {submitting ? 'Verifying…' : error ?? ' '}
         </p>
+
+        <button
+          type="button"
+          className="primary-btn primary-btn-block"
+          onClick={handlePay}
+          disabled={pin.length !== 4 || submitting}
+        >
+          {submitting ? 'Processing…' : 'Pay'}
+        </button>
 
         <button type="button" className="link-btn" onClick={onCancel} disabled={submitting}>
           Cancel

@@ -3,6 +3,9 @@ import { randomUUID } from "crypto";
 import fs from "fs";
 import path from "path";
 
+export const BUDGET_CATEGORIES = ["food", "transport", "shopping", "bills"];
+const BUDGET_CATEGORY_NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9 _-]{0,31}$/;
+
 const dataDir = process.env.DATA_DIR || path.join(process.cwd(), "data");
 fs.mkdirSync(dataDir, { recursive: true });
 
@@ -35,16 +38,29 @@ db.exec(`
     idempotency_key TEXT UNIQUE,
     from_account_id TEXT NOT NULL REFERENCES accounts(id),
     to_account_id TEXT NOT NULL REFERENCES accounts(id),
+    category TEXT NOT NULL DEFAULT 'other',
     amount INTEGER NOT NULL CHECK (amount > 0),
     status TEXT NOT NULL CHECK (status IN ('completed', 'failed')),
     failure_reason TEXT,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
   );
 
+  CREATE TABLE IF NOT EXISTS budgets (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id),
+    category TEXT NOT NULL,
+    monthly_limit INTEGER NOT NULL CHECK (monthly_limit >= 0),
+    threshold_percent INTEGER NOT NULL DEFAULT 80 CHECK (threshold_percent BETWEEN 1 AND 100),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    UNIQUE(user_id, category)
+  );
+
   CREATE INDEX IF NOT EXISTS idx_accounts_user ON accounts(user_id);
   CREATE INDEX IF NOT EXISTS idx_transactions_initiator ON transactions(initiated_by_user_id);
   CREATE INDEX IF NOT EXISTS idx_transactions_from ON transactions(from_account_id);
   CREATE INDEX IF NOT EXISTS idx_transactions_to ON transactions(to_account_id);
+  CREATE INDEX IF NOT EXISTS idx_budgets_user ON budgets(user_id);
 
   CREATE TRIGGER IF NOT EXISTS accounts_balance_nonnegative_insert
   BEFORE INSERT ON accounts
@@ -69,6 +85,11 @@ db.exec(`
 const userColumns = db.prepare("PRAGMA table_info(users)").all().map((c) => c.name);
 if (!userColumns.includes("upi_pin_hash")) {
   db.exec("ALTER TABLE users ADD COLUMN upi_pin_hash TEXT");
+}
+
+const transactionColumns = db.prepare("PRAGMA table_info(transactions)").all().map((c) => c.name);
+if (!transactionColumns.includes("category")) {
+  db.exec("ALTER TABLE transactions ADD COLUMN category TEXT NOT NULL DEFAULT 'other'");
 }
 
 // ---- row -> API JSON shape ----
@@ -100,10 +121,31 @@ function toTransactionJSON(row) {
     toAccountId: row.to_account_id,
     toAccountName: row.to_account_name,
     toUsername: row.to_username,
+    category: row.category,
     amount: row.amount,
     status: row.status,
     failureReason: row.failure_reason,
     createdAt: row.created_at,
+  };
+}
+
+function toBudgetJSON(row) {
+  if (!row) return row;
+  return {
+    id: row.id,
+    category: row.category,
+    monthlyLimit: row.monthly_limit,
+    spent: row.spent,
+    remaining: Math.max(row.monthly_limit - row.spent, 0),
+    utilizationPercent: row.monthly_limit === 0 ? 0 : Math.min(Math.round((row.spent / row.monthly_limit) * 100), 999),
+    thresholdPercent: row.threshold_percent,
+    status:
+      row.spent > row.monthly_limit
+        ? "exceeded"
+        : row.monthly_limit > 0 && row.spent >= Math.round((row.monthly_limit * row.threshold_percent) / 100)
+          ? "warning"
+          : "healthy",
+    monthKey: row.month_key,
   };
 }
 
@@ -189,6 +231,25 @@ const listAccountsByUserStmt = db.prepare(
   "SELECT * FROM accounts WHERE user_id = ? ORDER BY created_at ASC"
 );
 
+export function isValidBudgetCategoryName(category) {
+  return typeof category === "string" && BUDGET_CATEGORY_NAME_RE.test(category.trim());
+}
+
+export function normalizeBudgetCategory(category) {
+  if (!isValidBudgetCategoryName(category)) return "other";
+  return category.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+export function listBudgetCategories(userId) {
+  if (!userId) return [...BUDGET_CATEGORIES];
+  const customCategories = db
+    .prepare("SELECT DISTINCT category FROM budgets WHERE user_id = ? ORDER BY category ASC")
+    .all(userId)
+    .map((row) => row.category)
+    .filter((category) => !BUDGET_CATEGORIES.includes(category));
+  return [...BUDGET_CATEGORIES, ...customCategories];
+}
+
 export function listAccounts(userId) {
   return listAccountsByUserStmt.all(userId).map(toAccountJSON);
 }
@@ -205,6 +266,46 @@ export function getAccount(id, userId) {
   return toAccountJSON(row);
 }
 
+export function listBudgets(userId) {
+  return listBudgetRowsStmt.all(userId).map(toBudgetJSON);
+}
+
+export function upsertBudgets(userId, budgets) {
+  const txn = db.transaction((items) => {
+    for (const budget of items) {
+      upsertBudgetStmt.run({
+        id: randomUUID(),
+        userId,
+        category: normalizeBudgetCategory(budget.category),
+        monthlyLimit: budget.monthlyLimit,
+        thresholdPercent: budget.thresholdPercent ?? 80,
+      });
+    }
+  });
+
+  txn(budgets);
+  return listBudgets(userId);
+}
+
+const updateTransactionCategoryStmt = db.prepare(
+  "UPDATE transactions SET category = @category WHERE id = @id AND initiated_by_user_id = @userId"
+);
+
+export function updateTransactionCategory(userId, transactionId, category) {
+  const normalizedCategory = normalizeBudgetCategory(category);
+  const result = updateTransactionCategoryStmt.run({ id: transactionId, userId, category: normalizedCategory });
+  if (result.changes === 0) return null;
+  return getTransaction(transactionId, userId);
+}
+
+export function deleteBudgetCategory(userId, category) {
+  const normalizedCategory = normalizeBudgetCategory(category);
+  const result = db
+    .prepare("DELETE FROM budgets WHERE user_id = ? AND category = ?")
+    .run(userId, normalizedCategory);
+  return result.changes > 0;
+}
+
 // ---- transactions / transfers ----
 
 const debitAccountStmt = db.prepare(
@@ -214,13 +315,52 @@ const creditAccountStmt = db.prepare(
   "UPDATE accounts SET balance = balance + @amount WHERE id = @accountId"
 );
 const insertTransactionStmt = db.prepare(`
-  INSERT INTO transactions (id, initiated_by_user_id, idempotency_key, from_account_id, to_account_id, amount, status, failure_reason)
-  VALUES (@id, @userId, @idempotencyKey, @fromAccountId, @toAccountId, @amount, @status, @failureReason)
+  INSERT INTO transactions (id, initiated_by_user_id, idempotency_key, from_account_id, to_account_id, category, amount, status, failure_reason)
+  VALUES (@id, @userId, @idempotencyKey, @fromAccountId, @toAccountId, @category, @amount, @status, @failureReason)
 `);
 const getTransactionRawStmt = db.prepare(`${TRANSACTION_SELECT} WHERE t.id = ?`);
 const getTransactionByIdempotencyKeyStmt = db.prepare(
   `${TRANSACTION_SELECT} WHERE t.idempotency_key = ? AND t.initiated_by_user_id = ?`
 );
+const listBudgetRowsStmt = db.prepare(`
+  WITH month_bounds AS (
+    SELECT
+      strftime('%Y-%m', 'now') AS month_key,
+      strftime('%Y-%m-01T00:00:00.000Z', 'now') AS month_start,
+      strftime('%Y-%m-01T00:00:00.000Z', 'now', '+1 month') AS month_end
+  )
+  SELECT
+    b.*,
+    mb.month_key,
+    COALESCE(SUM(
+      CASE
+        WHEN t.status = 'completed'
+         AND fa.user_id = b.user_id
+         AND ta.user_id != fa.user_id
+         AND t.category = b.category
+         AND t.created_at >= mb.month_start
+         AND t.created_at < mb.month_end
+        THEN t.amount
+        ELSE 0
+      END
+    ), 0) AS spent
+  FROM budgets b
+  CROSS JOIN month_bounds mb
+  LEFT JOIN transactions t ON t.initiated_by_user_id = b.user_id
+  LEFT JOIN accounts fa ON fa.id = t.from_account_id
+  LEFT JOIN accounts ta ON ta.id = t.to_account_id
+  WHERE b.user_id = ?
+  GROUP BY b.id
+  ORDER BY b.category ASC
+`);
+const upsertBudgetStmt = db.prepare(`
+  INSERT INTO budgets (id, user_id, category, monthly_limit, threshold_percent)
+  VALUES (@id, @userId, @category, @monthlyLimit, @thresholdPercent)
+  ON CONFLICT(user_id, category) DO UPDATE SET
+    monthly_limit = excluded.monthly_limit,
+    threshold_percent = excluded.threshold_percent,
+    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+`);
 
 class TransferError extends Error {
   constructor(status, code, message, transaction = null) {
@@ -240,8 +380,13 @@ function insufficientFundsError(transaction) {
   );
 }
 
-function assertSameIdempotentTransfer(existing, { fromAccountId, toUsername, amount }) {
-  if (existing.from_account_id !== fromAccountId || existing.to_username !== toUsername || existing.amount !== amount) {
+function assertSameIdempotentTransfer(existing, { fromAccountId, toUsername, amount, category }) {
+  if (
+    existing.from_account_id !== fromAccountId ||
+    existing.to_username !== toUsername ||
+    existing.amount !== amount ||
+    existing.category !== category
+  ) {
     throw new TransferError(
       409,
       "IDEMPOTENCY_KEY_REUSED",
@@ -275,7 +420,7 @@ function resolveDestinationAccountId(userId, fromAccountId, toUsername) {
 // A failed (insufficient-funds) attempt still commits as a history row — only
 // throwing here would roll back that audit record along with everything else.
 const transferTxn = db.transaction(
-  ({ id, userId, idempotencyKey, fromAccountId, toUsername, amount }) => {
+  ({ id, userId, idempotencyKey, fromAccountId, toUsername, amount, category }) => {
     const from = getAccountRawStmt.get(fromAccountId);
     if (!from || from.user_id !== userId) {
       throw new TransferError(404, "ACCOUNT_NOT_FOUND", `Account ${fromAccountId} not found`);
@@ -290,6 +435,7 @@ const transferTxn = db.transaction(
         idempotencyKey: idempotencyKey ?? null,
         fromAccountId,
         toAccountId,
+        category,
         amount,
         status: "failed",
         failureReason: "insufficient_funds",
@@ -305,6 +451,7 @@ const transferTxn = db.transaction(
         idempotencyKey: idempotencyKey ?? null,
         fromAccountId,
         toAccountId,
+        category,
         amount,
         status: "failed",
         failureReason: "insufficient_funds",
@@ -323,6 +470,7 @@ const transferTxn = db.transaction(
       idempotencyKey: idempotencyKey ?? null,
       fromAccountId,
       toAccountId,
+      category,
       amount,
       status: "completed",
       failureReason: null,
@@ -332,7 +480,7 @@ const transferTxn = db.transaction(
   }
 );
 
-export function transfer({ userId, fromAccountId, toUsername, amount, idempotencyKey }) {
+export function transfer({ userId, fromAccountId, toUsername, amount, idempotencyKey, category }) {
   if (!Number.isSafeInteger(amount) || amount <= 0) {
     throw new TransferError(400, "INVALID_AMOUNT", "amount must be a positive integer (cents)");
   }
@@ -341,11 +489,17 @@ export function transfer({ userId, fromAccountId, toUsername, amount, idempotenc
   }
 
   const normalizedToUsername = toUsername.trim().toLowerCase();
+  const normalizedCategory = normalizeBudgetCategory(category);
 
   if (idempotencyKey) {
     const existing = getTransactionByIdempotencyKeyStmt.get(idempotencyKey, userId);
     if (existing) {
-      assertSameIdempotentTransfer(existing, { fromAccountId, toUsername: normalizedToUsername, amount });
+      assertSameIdempotentTransfer(existing, {
+        fromAccountId,
+        toUsername: normalizedToUsername,
+        amount,
+        category: normalizedCategory,
+      });
       if (existing.status === "failed") throw insufficientFundsError(existing);
       return { transaction: toTransactionJSON(existing), replayed: true };
     }
@@ -358,6 +512,7 @@ export function transfer({ userId, fromAccountId, toUsername, amount, idempotenc
       idempotencyKey,
       fromAccountId,
       toUsername: normalizedToUsername,
+      category: normalizedCategory,
       amount,
     });
     if (transaction.status === "failed") {
@@ -369,7 +524,125 @@ export function transfer({ userId, fromAccountId, toUsername, amount, idempotenc
     if (err.code === "SQLITE_CONSTRAINT_UNIQUE") {
       const existing = getTransactionByIdempotencyKeyStmt.get(idempotencyKey, userId);
       if (existing) {
-        assertSameIdempotentTransfer(existing, { fromAccountId, toUsername: normalizedToUsername, amount });
+        assertSameIdempotentTransfer(existing, {
+          fromAccountId,
+          toUsername: normalizedToUsername,
+          amount,
+          category: normalizedCategory,
+        });
+        if (existing.status === "failed") throw insufficientFundsError(existing);
+        return { transaction: toTransactionJSON(existing), replayed: true };
+      }
+    }
+    throw err;
+  }
+}
+
+// Moves money between two accounts owned by the same user (e.g. Savings ->
+// Checking). Tagged with the fixed "transfer" category, which the budgets
+// query already excludes from "spent" (it only counts money that left the
+// user's own accounts) — so internal moves never distort a budget.
+const OWN_ACCOUNT_TRANSFER_CATEGORY = "transfer";
+
+const ownAccountTransferTxn = db.transaction(({ id, userId, idempotencyKey, fromAccountId, toAccountId, amount }) => {
+  const from = getAccountRawStmt.get(fromAccountId);
+  if (!from || from.user_id !== userId) {
+    throw new TransferError(404, "ACCOUNT_NOT_FOUND", `Account ${fromAccountId} not found`);
+  }
+  const to = getAccountRawStmt.get(toAccountId);
+  if (!to || to.user_id !== userId) {
+    throw new TransferError(404, "ACCOUNT_NOT_FOUND", `Account ${toAccountId} not found`);
+  }
+
+  if (from.balance < amount) {
+    insertTransactionStmt.run({
+      id,
+      userId,
+      idempotencyKey: idempotencyKey ?? null,
+      fromAccountId,
+      toAccountId,
+      category: OWN_ACCOUNT_TRANSFER_CATEGORY,
+      amount,
+      status: "failed",
+      failureReason: "insufficient_funds",
+    });
+    return getTransactionRawStmt.get(id);
+  }
+
+  const debit = debitAccountStmt.run({ amount, accountId: fromAccountId });
+  if (debit.changes !== 1) {
+    insertTransactionStmt.run({
+      id,
+      userId,
+      idempotencyKey: idempotencyKey ?? null,
+      fromAccountId,
+      toAccountId,
+      category: OWN_ACCOUNT_TRANSFER_CATEGORY,
+      amount,
+      status: "failed",
+      failureReason: "insufficient_funds",
+    });
+    return getTransactionRawStmt.get(id);
+  }
+
+  creditAccountStmt.run({ amount, accountId: toAccountId });
+
+  insertTransactionStmt.run({
+    id,
+    userId,
+    idempotencyKey: idempotencyKey ?? null,
+    fromAccountId,
+    toAccountId,
+    category: OWN_ACCOUNT_TRANSFER_CATEGORY,
+    amount,
+    status: "completed",
+    failureReason: null,
+  });
+
+  return getTransactionRawStmt.get(id);
+});
+
+export function transferToOwnAccount({ userId, fromAccountId, toAccountId, amount, idempotencyKey }) {
+  if (!Number.isSafeInteger(amount) || amount <= 0) {
+    throw new TransferError(400, "INVALID_AMOUNT", "amount must be a positive integer (cents)");
+  }
+  if (typeof fromAccountId !== "string" || typeof toAccountId !== "string") {
+    throw new TransferError(400, "INVALID_ACCOUNT", "fromAccountId and toAccountId are required");
+  }
+  if (fromAccountId === toAccountId) {
+    throw new TransferError(400, "SAME_ACCOUNT", "Choose two different accounts to transfer between");
+  }
+
+  if (idempotencyKey) {
+    const existing = getTransactionByIdempotencyKeyStmt.get(idempotencyKey, userId);
+    if (existing) {
+      if (
+        existing.from_account_id !== fromAccountId ||
+        existing.to_account_id !== toAccountId ||
+        existing.amount !== amount
+      ) {
+        throw new TransferError(
+          409,
+          "IDEMPOTENCY_KEY_REUSED",
+          "This idempotency key has already been used for a different transfer"
+        );
+      }
+      if (existing.status === "failed") throw insufficientFundsError(existing);
+      return { transaction: toTransactionJSON(existing), replayed: true };
+    }
+  }
+
+  try {
+    const transaction = ownAccountTransferTxn({ id: randomUUID(), userId, idempotencyKey, fromAccountId, toAccountId, amount });
+    if (transaction.status === "failed") {
+      throw insufficientFundsError(transaction);
+    }
+    return { transaction: toTransactionJSON(transaction), replayed: false };
+  } catch (err) {
+    if (err instanceof TransferError) throw err;
+    if (err.code === "SQLITE_CONSTRAINT_UNIQUE") {
+      const existing = getTransactionByIdempotencyKeyStmt.get(idempotencyKey, userId);
+      if (existing) {
         if (existing.status === "failed") throw insufficientFundsError(existing);
         return { transaction: toTransactionJSON(existing), replayed: true };
       }

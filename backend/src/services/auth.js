@@ -18,6 +18,24 @@ export function verifyPassword(password, stored) {
   return candidate.length === expected.length && timingSafeEqual(candidate, expected);
 }
 
+const PIN_RE = /^\d{4}$/;
+
+// Checks a payment/verification attempt against the account's UPI PIN.
+// Returns null when authorized, or an { status, code, message } describing
+// why it wasn't.
+export function checkPinAuthorization(user, pin) {
+  if (!user.upi_pin_hash) {
+    return { status: 403, code: "PIN_NOT_SET", message: "Set a UPI PIN before making transfers" };
+  }
+  if (typeof pin !== "string" || !PIN_RE.test(pin)) {
+    return { status: 400, code: "INVALID_PIN", message: "UPI PIN must be exactly 4 digits" };
+  }
+  if (!verifyPassword(pin, user.upi_pin_hash)) {
+    return { status: 401, code: "INCORRECT_PIN", message: "Incorrect UPI PIN" };
+  }
+  return null;
+}
+
 export function signToken(userId) {
   return jwt.sign({ sub: userId }, JWT_SECRET, { expiresIn: TOKEN_TTL });
 }

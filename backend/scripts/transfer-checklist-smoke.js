@@ -7,7 +7,7 @@ import { randomUUID } from "crypto";
 const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "finflow-transfer-check-"));
 process.env.DATA_DIR = tempRoot;
 
-const { createUser, listAccounts, transfer, listTransactions } = await import("../src/config/database.js");
+const { createUser, listAccounts, transfer, listTransactions, upsertBudgets, listBudgets } = await import("../src/config/database.js");
 
 function createDemoUser(label) {
   const token = randomUUID().slice(0, 8);
@@ -30,6 +30,7 @@ const exactBalanceTransfer = transfer({
   userId: sender.id,
   fromAccountId: senderAccount.id,
   toUsername: receiver.username,
+  category: "other",
   amount: exactBalanceAmount,
   idempotencyKey: `exact_${randomUUID()}`,
 });
@@ -50,6 +51,7 @@ try {
     userId: senderTwo.id,
     fromAccountId: senderTwoAccount.id,
     toUsername: receiverTwo.username,
+    category: "bills",
     amount: senderTwoOriginalBalance + 1,
     idempotencyKey: `insufficient_${randomUUID()}`,
   });
@@ -73,6 +75,7 @@ const firstTransfer = transfer({
   userId: senderThree.id,
   fromAccountId: senderThreeAccount.id,
   toUsername: receiverThree.username,
+  category: "shopping",
   amount: 1250,
   idempotencyKey,
 });
@@ -81,6 +84,7 @@ const replayedTransfer = transfer({
   userId: senderThree.id,
   fromAccountId: senderThreeAccount.id,
   toUsername: receiverThree.username,
+  category: "shopping",
   amount: 1250,
   idempotencyKey,
 });
@@ -97,6 +101,7 @@ try {
     userId: senderThree.id,
     fromAccountId: senderThreeAccount.id,
     toUsername: receiverThree.username,
+    category: "food",
     amount: 1251,
     idempotencyKey,
   });
@@ -113,6 +118,7 @@ try {
     userId: senderThree.id,
     fromAccountId: senderThreeAccount.id,
     toUsername: senderThree.username,
+    category: "other",
     amount: 100,
     idempotencyKey: `self_${randomUUID()}`,
   });
@@ -125,5 +131,17 @@ assert.equal(selfTransferError.code, "SELF_TRANSFER_BLOCKED");
 
 const senderThreeTransactions = listTransactions({ userId: senderThree.id });
 assert.ok(senderThreeTransactions.some((tx) => tx.id === firstTransfer.transaction.id));
+assert.equal(firstTransfer.transaction.category, "shopping");
+
+const budgetRows = upsertBudgets(senderThree.id, [
+  { category: "shopping", monthlyLimit: 5000, thresholdPercent: 70 },
+  { category: "food", monthlyLimit: 10000, thresholdPercent: 80 },
+]);
+
+const shoppingBudget = budgetRows.find((budget) => budget.category === "shopping");
+assert.ok(shoppingBudget);
+assert.equal(shoppingBudget.spent, 1250);
+assert.equal(shoppingBudget.status, "healthy");
+assert.equal(listBudgets(senderThree.id).length >= 2, true);
 
 console.log("transfer checklist smoke passed");
