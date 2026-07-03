@@ -2,6 +2,12 @@
 
 Node/Express API for FinFlow.
 
+## Features
+
+- Authentication, account, transfer, and transaction APIs backed by SQLite
+- CSV import parsing with FinFlow export detection, validation, duplicate checks, and undo support
+- Analytics endpoints for monthly spending trends, category totals, and transaction summaries
+
 ## Structure
 
 - `src/server.js` - Express app entry point

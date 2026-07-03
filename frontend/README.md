@@ -2,6 +2,12 @@
 
 React + TypeScript + Vite client for FinFlow.
 
+## Features
+
+- Transfer workflow, account overview, and searchable transaction history
+- Import review UI for uploaded transaction CSVs, including duplicate warnings and undo actions
+- Analytics dashboard with category and monthly trend charts
+
 ## Structure
 
 - `src/api/` - API client and shared API types
@@ -9,6 +15,7 @@ React + TypeScript + Vite client for FinFlow.
 - `src/components/accounts/` - account display UI
 - `src/components/transfers/` - transfer workflow UI
 - `src/components/transactions/` - transaction history UI
+- `src/components/analytics/` - spending analytics dashboard and chart components
 - `src/components/shared/` - reusable UI components
 - `src/styles/` - app and global styles
 - `public/` - static assets
