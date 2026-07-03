@@ -1,0 +1,91 @@
+:root {
+  --text: #5f6b7a;
+  --text-h: #122033;
+  --bg: #f3f7fb;
+  --surface: #ffffff;
+  --border: #d8e3ef;
+  --code-bg: #edf3f8;
+  --accent: #0f766e;
+  --accent-2: #0f172a;
+  --accent-bg: rgba(15, 118, 110, 0.1);
+  --accent-border: rgba(15, 118, 110, 0.32);
+  --success: #0f9f6e;
+  --success-bg: rgba(15, 159, 110, 0.12);
+  --danger: #d14343;
+  --danger-bg: rgba(209, 67, 67, 0.1);
+  --shadow-sm: 0 1px 2px rgba(18, 32, 51, 0.05);
+  --shadow:
+    0 1px 3px rgba(18, 32, 51, 0.05), 0 12px 28px -14px rgba(18, 32, 51, 0.2);
+  --shadow-lg:
+    0 8px 24px rgba(18, 32, 51, 0.08), 0 30px 60px -24px rgba(18, 32, 51, 0.24);
+
+  --sans: 'Manrope', 'Avenir Next', 'Segoe UI', sans-serif;
+  --heading: 'Manrope', 'Avenir Next', 'Segoe UI', sans-serif;
+  --mono: ui-monospace, 'SF Mono', Consolas, monospace;
+
+  font: 16px/150% var(--sans);
+  letter-spacing: -0.011em;
+  color-scheme: light;
+  color: var(--text);
+  background: var(--bg);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+#root {
+  min-height: 100svh;
+  display: flex;
+  flex-direction: column;
+}
+
+body {
+  margin: 0;
+  background:
+    radial-gradient(circle at top left, rgba(15, 118, 110, 0.08), transparent 26%),
+    radial-gradient(circle at 85% 10%, rgba(15, 23, 42, 0.05), transparent 24%),
+    var(--bg);
+}
+
+h1,
+h2,
+h3 {
+  font-family: var(--heading);
+  font-weight: 600;
+  color: var(--text-h);
+  letter-spacing: -0.02em;
+}
+
+h1 {
+  font-size: 32px;
+  margin: 0;
+}
+
+h2 {
+  font-size: 17px;
+  margin: 0;
+}
+
+p {
+  margin: 0;
+}
+
+button {
+  font-family: inherit;
+}
+
+code {
+  font-family: var(--mono);
+  display: inline-flex;
+  border-radius: 4px;
+  color: var(--text-h);
+  font-size: 14px;
+  line-height: 135%;
+  padding: 4px 8px;
+  background: var(--code-bg);
+}

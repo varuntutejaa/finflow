@@ -1,0 +1,16 @@
+{
+  "name": "finflow-backend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "cors": "^2.8.5",
+    "better-sqlite3": "^11.3.0",
+    "jsonwebtoken": "^9.0.2"
+  }
+}
