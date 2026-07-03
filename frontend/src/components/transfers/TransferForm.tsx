@@ -12,11 +12,23 @@ import {
 } from '../../api'
 import { PinModal } from '../shared/PinModal'
 
+export interface SettlementPrefill {
+  groupId: string
+  settlementId: string
+  groupName: string
+  toUsername: string
+  toName: string
+  amountPaise: number
+}
+
 interface Props {
   accounts: Account[]
   categories: string[]
   budgetingEnabled: boolean
   onTransferred: () => void
+  settlementPrefill?: SettlementPrefill | null
+  onSettlementPaid?: (context: { groupId: string; settlementId: string }, transactionId: string, amountPaise: number) => void
+  onCancelSettlement?: () => void
 }
 
 interface PendingPersonTransfer {
@@ -28,6 +40,7 @@ interface PendingPersonTransfer {
   category: string
   amountCents: number
   idempotencyKey: string
+  settlementContext?: { groupId: string; settlementId: string } | null
 }
 
 interface PendingOwnTransfer {
@@ -75,7 +88,15 @@ function loadCategoryNotes(): Record<string, string> {
   }
 }
 
-export function TransferForm({ accounts, categories, budgetingEnabled, onTransferred }: Props) {
+export function TransferForm({
+  accounts,
+  categories,
+  budgetingEnabled,
+  onTransferred,
+  settlementPrefill = null,
+  onSettlementPaid,
+  onCancelSettlement,
+}: Props) {
   const [mode, setMode] = useState<'person' | 'own'>('person')
   const [toQuery, setToQuery] = useState('')
   const [toUsername, setToUsername] = useState('')
@@ -105,6 +126,28 @@ export function TransferForm({ accounts, categories, budgetingEnabled, onTransfe
       : categoryOptions[0] ?? BUDGET_CATEGORIES[0]
     : 'other'
   const categoryNoteRequired = selectedCategory === 'other'
+
+  useEffect(() => {
+    if (settlementPrefill) {
+      setMode('person')
+      setToUsername(settlementPrefill.toUsername)
+      setToQuery(`${settlementPrefill.toName} (@${settlementPrefill.toUsername})`)
+      setSelectedRecipient({
+        id: settlementPrefill.toUsername,
+        username: settlementPrefill.toUsername,
+        name: settlementPrefill.toName,
+        email: '',
+        isSelf: false,
+      })
+      setAmount(String(settlementPrefill.amountPaise / 100))
+      setError(null)
+    } else {
+      setToUsername('')
+      setToQuery('')
+      setSelectedRecipient(null)
+      setAmount('')
+    }
+  }, [settlementPrefill])
 
   useEffect(() => {
     if (accounts.length === 0) return
@@ -212,7 +255,7 @@ export function TransferForm({ accounts, categories, budgetingEnabled, onTransfe
       setError('Search for a recipient and select them from the list.')
       return
     }
-    if (categoryNoteRequired && categoryNote.trim().length === 0) {
+    if (!settlementPrefill && categoryNoteRequired && categoryNote.trim().length === 0) {
       setError('Add a short note to explain which category this should go under.')
       return
     }
@@ -223,9 +266,12 @@ export function TransferForm({ accounts, categories, budgetingEnabled, onTransfe
       fromAccountName: fromAccount.accountName,
       toUsername,
       toLabel: toQuery,
-      category: selectedCategory,
+      category: settlementPrefill ? 'settlement' : selectedCategory,
       amountCents: cents,
       idempotencyKey: crypto.randomUUID(),
+      settlementContext: settlementPrefill
+        ? { groupId: settlementPrefill.groupId, settlementId: settlementPrefill.settlementId }
+        : null,
     })
   }
 
@@ -287,6 +333,9 @@ export function TransferForm({ accounts, categories, budgetingEnabled, onTransfe
           return next
         })
       }
+      if (transferRequest.kind === 'person' && transferRequest.settlementContext) {
+        onSettlementPaid?.(transferRequest.settlementContext, transaction.id, transferRequest.amountCents)
+      }
       onTransferred()
 
       await wait(10000)
@@ -338,11 +387,33 @@ export function TransferForm({ accounts, categories, budgetingEnabled, onTransfe
 
       <div className="transfer-panel-head">
         <div>
-          <h2>Send Money</h2>
-          <p className="muted">Route a verified payout with live confirmation and one-step UPI authorization.</p>
+          <h2>{settlementPrefill ? 'Settle Up' : 'Send Money'}</h2>
+          <p className="muted">
+            {settlementPrefill
+              ? `Paying your share for ${settlementPrefill.groupName}.`
+              : 'Route a verified payout with live confirmation and one-step UPI authorization.'}
+          </p>
         </div>
       </div>
 
+      {settlementPrefill && (
+        <div className="settlement-summary-card">
+          <strong>{settlementPrefill.groupName}</strong>
+          <div className="settlement-summary-row">
+            <span>Paying</span>
+            <span>{settlementPrefill.toName}</span>
+          </div>
+          <div className="settlement-summary-row">
+            <span>Amount</span>
+            <span>{formatMoney(settlementPrefill.amountPaise)}</span>
+          </div>
+          <button type="button" className="link-btn" onClick={onCancelSettlement}>
+            Cancel and send a regular payment instead
+          </button>
+        </div>
+      )}
+
+      {!settlementPrefill && (
       <div className="transfer-mode-tabs" role="tablist" aria-label="Transfer type">
         <button
           type="button"
@@ -363,9 +434,10 @@ export function TransferForm({ accounts, categories, budgetingEnabled, onTransfe
           Between my accounts
         </button>
       </div>
+      )}
 
       <form className="transfer-form" onSubmit={handleSubmit}>
-        {mode === 'person' ? (
+        {settlementPrefill ? null : mode === 'person' ? (
           <>
             <div className="search-field" ref={searchBoxRef}>
               <label className="gateway-label">
@@ -507,36 +579,38 @@ export function TransferForm({ accounts, categories, budgetingEnabled, onTransfe
           </div>
         )}
 
-        <div className="transfer-section">
-          <label className="gateway-label">
-            <span className="transfer-section-head">
-              <span className="transfer-section-kicker">Payout amount</span>
-              <span className="transfer-section-meta">Up to {formatMoney(MAX_TRANSFER_AMOUNT_PAISE)} per transfer</span>
-            </span>
-            <div className="input-with-icon">
-              <span className="input-icon input-icon-text">₹</span>
-              <input
-                type="number"
-                step="0.01"
-                min="0"
-                placeholder="0.00"
-                value={amount}
-                onChange={(e) => setAmount(e.target.value)}
-              />
-            </div>
-          </label>
+        {!settlementPrefill && (
+          <div className="transfer-section">
+            <label className="gateway-label">
+              <span className="transfer-section-head">
+                <span className="transfer-section-kicker">Payout amount</span>
+                <span className="transfer-section-meta">Up to {formatMoney(MAX_TRANSFER_AMOUNT_PAISE)} per transfer</span>
+              </span>
+              <div className="input-with-icon">
+                <span className="input-icon input-icon-text">₹</span>
+                <input
+                  type="number"
+                  step="0.01"
+                  min="0"
+                  placeholder="0.00"
+                  value={amount}
+                  onChange={(e) => setAmount(e.target.value)}
+                />
+              </div>
+            </label>
 
-          <div className="amount-presets" aria-label="Quick amounts">
-            {quickAmounts.map((value) => (
-              <button key={value} type="button" className="amount-preset" onClick={() => applyQuickAmount(value)}>
-                ₹{value}
-              </button>
-            ))}
+            <div className="amount-presets" aria-label="Quick amounts">
+              {quickAmounts.map((value) => (
+                <button key={value} type="button" className="amount-preset" onClick={() => applyQuickAmount(value)}>
+                  ₹{value}
+                </button>
+              ))}
+            </div>
           </div>
-        </div>
+        )}
 
         <button type="submit" className="primary-btn primary-btn-block" disabled={Boolean(paymentPopup || pending)}>
-          {paymentPopup || pending ? 'Processing...' : mode === 'own' ? 'Move money' : 'Pay'}
+          {paymentPopup || pending ? 'Processing...' : settlementPrefill ? 'Pay settlement' : mode === 'own' ? 'Move money' : 'Pay'}
         </button>
 
         {error && <p className="form-error">{error}</p>}

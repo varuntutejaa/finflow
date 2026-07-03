@@ -5,6 +5,7 @@ import usersRouter from "./routes/users.js";
 import accountsRouter from "./routes/accounts.js";
 import transactionsRouter from "./routes/transactions.js";
 import budgetsRouter from "./routes/budgets.js";
+import groupsRouter from "./routes/groups.js";
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -21,6 +22,7 @@ app.use("/api/users", usersRouter);
 app.use("/api/accounts", accountsRouter);
 app.use("/api/transactions", transactionsRouter);
 app.use("/api/budgets", budgetsRouter);
+app.use("/api/groups", groupsRouter);
 
 app.use((err, req, res, next) => {
   console.error(err);

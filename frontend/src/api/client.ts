@@ -50,6 +50,73 @@ export interface BudgetSummary {
   monthKey: string
 }
 
+export interface GroupSummary {
+  id: string
+  name: string
+  createdAt: string
+  memberCount: number
+  yourNetBalance: number
+}
+
+export interface GroupMember {
+  id: string
+  username: string
+  name: string
+}
+
+export interface ExpenseSplit {
+  userId: string
+  username: string
+  name: string
+  shareAmount: number
+}
+
+export interface Expense {
+  id: string
+  description: string
+  amount: number
+  paidByUserId: string
+  paidByUsername: string
+  paidByName: string
+  createdAt: string
+  splits: ExpenseSplit[]
+}
+
+export interface GroupBalance {
+  userId: string
+  username: string
+  name: string
+  totalPaid: number
+  totalOwed: number
+  netBalance: number
+}
+
+export interface Settlement {
+  id: string
+  fromUserId: string
+  fromUsername: string
+  fromName: string
+  toUserId: string
+  toUsername: string
+  toName: string
+  amount: number
+  amountPaid: number
+  remainingAmount: number
+  status: 'pending' | 'paid'
+  createdAt: string
+  paidAt: string | null
+}
+
+export interface GroupDetail {
+  id: string
+  name: string
+  createdAt: string
+  members: GroupMember[]
+  expenses: Expense[]
+  balances: GroupBalance[]
+  settlements: Settlement[]
+}
+
 export interface ApiError {
   code: string
   message: string
@@ -197,6 +264,64 @@ export function transfer(input: {
   category: string
 }): Promise<{ transaction: Transaction; replayed: boolean; accounts: Account[] }> {
   return request('/api/transactions/transfer', {
+    method: 'POST',
+    body: JSON.stringify(input),
+  })
+}
+
+export function fetchGroups(): Promise<GroupSummary[]> {
+  return request('/api/groups')
+}
+
+export function createGroup(input: { name: string; memberUsernames: string[] }): Promise<GroupDetail> {
+  return request('/api/groups', { method: 'POST', body: JSON.stringify(input) })
+}
+
+export function fetchGroupDetail(groupId: string): Promise<GroupDetail> {
+  return request(`/api/groups/${encodeURIComponent(groupId)}`)
+}
+
+export function addGroupMember(groupId: string, username: string): Promise<GroupDetail> {
+  return request(`/api/groups/${encodeURIComponent(groupId)}/members`, {
+    method: 'POST',
+    body: JSON.stringify({ username }),
+  })
+}
+
+export function addExpense(
+  groupId: string,
+  input: {
+    description: string
+    amount: number
+    paidByUsername?: string
+    splitType: 'equal' | 'custom'
+    participantUsernames?: string[]
+    customSplits?: Array<{ username: string; shareAmount: number }>
+  }
+): Promise<GroupDetail> {
+  return request(`/api/groups/${encodeURIComponent(groupId)}/expenses`, {
+    method: 'POST',
+    body: JSON.stringify(input),
+  })
+}
+
+export function generateSettlements(groupId: string): Promise<GroupDetail> {
+  return request(`/api/groups/${encodeURIComponent(groupId)}/settlements/generate`, { method: 'POST' })
+}
+
+export function markSettlementPaid(groupId: string, settlementId: string): Promise<GroupDetail> {
+  return request(`/api/groups/${encodeURIComponent(groupId)}/settlements/${encodeURIComponent(settlementId)}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ status: 'paid' }),
+  })
+}
+
+export function paySettlement(
+  groupId: string,
+  settlementId: string,
+  input: { amount: number; transactionId: string }
+): Promise<GroupDetail> {
+  return request(`/api/groups/${encodeURIComponent(groupId)}/settlements/${encodeURIComponent(settlementId)}/pay`, {
     method: 'POST',
     body: JSON.stringify(input),
   })

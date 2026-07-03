@@ -4,11 +4,13 @@ import { clearToken, fetchAccounts, fetchBudgets, fetchMe, fetchTransactions, ge
 import { AccountsPanel } from './components/accounts/AccountsPanel'
 import { AuthForm } from './components/auth/AuthForm'
 import { BudgetPage } from './components/budgets/BudgetPage'
+import { SplitPage } from './components/split/SplitPage'
+import { SettlementPayPopup } from './components/split/SettlementPayPopup'
 import { SetPinModal } from './components/auth/SetPinModal'
 import { PinModal } from './components/shared/PinModal'
 import { TransactionHistory } from './components/transactions/TransactionHistory'
 import { TransferForm } from './components/transfers/TransferForm'
-import { formatMoney, verifyPin } from './api'
+import { formatMoney, verifyPin, paySettlement } from './api'
 import './styles/App.css'
 
 const HIDDEN_BALANCE = '₹ ••••••'
@@ -122,6 +124,21 @@ function SearchIcon() {
   )
 }
 
+function RupeeIcon() {
+  return (
+    <svg className="navbar-tab-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path
+        d="M6 4h12M6 4c4 0 7 1.5 7 4.5S16 13 12 13H6l8 7"
+        stroke="currentColor"
+        strokeWidth="1.8"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <path d="M6 8.5h12" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+    </svg>
+  )
+}
+
 function App() {
   const [user, setUser] = useState<User | null>(null)
   const [needsPinSetup, setNeedsPinSetup] = useState(false)
@@ -141,11 +158,24 @@ function App() {
   const [loadError, setLoadError] = useState<string | null>(null)
   const [balancesVisible, setBalancesVisible] = useState(false)
   const [revealingBalances, setRevealingBalances] = useState(false)
-  const [page, setPage] = useState<'dashboard' | 'budgets'>('dashboard')
+  const [page, setPage] = useState<'dashboard' | 'budgets' | 'split'>('dashboard')
   const [budgetAlert, setBudgetAlert] = useState<{ category: string; status: 'warning' | 'exceeded'; utilizationPercent: number } | null>(
     null
   )
   const previousBudgetsRef = useRef<BudgetSummary[]>([])
+
+  // Set when the user clicks "Pay" on a pending bill-split settlement — drives
+  // both the amount-picker popup (shown while confirmedAmount is null) and,
+  // once an amount is chosen, the prefilled settle-up flow on the Pay page.
+  const [settlementPayment, setSettlementPayment] = useState<{
+    groupId: string
+    settlementId: string
+    groupName: string
+    toUsername: string
+    toName: string
+    remainingAmount: number
+    confirmedAmount: number | null
+  } | null>(null)
 
   const logout = useCallback(() => {
     clearToken()
@@ -159,6 +189,7 @@ function App() {
     setPage('dashboard')
     setBudgetAlert(null)
     previousBudgetsRef.current = []
+    setSettlementPayment(null)
   }, [])
 
   const budgetingEnabled = user ? budgetingPreferences[user.username] ?? true : true
@@ -218,6 +249,40 @@ function App() {
       setLoading(false)
     }
   }, [logout])
+
+  // Called from the Split page when the user clicks "Pay" on a pending
+  // settlement — jumps to the Pay tab and opens the amount-picker popup.
+  const startSettlementPayment = useCallback(
+    (context: { groupId: string; settlementId: string; groupName: string; toUsername: string; toName: string; remainingAmount: number }) => {
+      setSettlementPayment({ ...context, confirmedAmount: null })
+      setPage('dashboard')
+    },
+    []
+  )
+
+  const confirmSettlementAmount = useCallback((amountPaise: number) => {
+    setSettlementPayment((current) => (current ? { ...current, confirmedAmount: amountPaise } : current))
+  }, [])
+
+  const cancelSettlementPayment = useCallback(() => {
+    setSettlementPayment(null)
+  }, [])
+
+  // Fired by TransferForm right after the real money movement for a
+  // settlement succeeds — records the (possibly partial) payment against the
+  // settlement so the split group's balances and status reflect it.
+  const handleSettlementPaid = useCallback(
+    async (context: { groupId: string; settlementId: string }, transactionId: string, amountPaise: number) => {
+      try {
+        await paySettlement(context.groupId, context.settlementId, { amount: amountPaise, transactionId })
+      } catch (err) {
+        setLoadError(err instanceof Error ? err.message : 'Payment sent, but could not update the settlement record')
+      } finally {
+        setSettlementPayment(null)
+      }
+    },
+    []
+  )
 
   useEffect(() => {
     const token = getToken()
@@ -311,7 +376,16 @@ function App() {
             onClick={() => setPage('dashboard')}
             aria-pressed={page === 'dashboard'}
           >
+            <RupeeIcon />
             Pay
+          </button>
+          <button
+            type="button"
+            className={`navbar-tab navbar-tab-split${page === 'split' ? ' navbar-tab-active' : ''}`}
+            onClick={() => setPage('split')}
+            aria-pressed={page === 'split'}
+          >
+            Split
           </button>
         </div>
         <div className="navbar-user">
@@ -384,6 +458,20 @@ function App() {
                   categories={budgetCategories}
                   budgetingEnabled={budgetingEnabled}
                   onTransferred={refresh}
+                  settlementPrefill={
+                    settlementPayment && settlementPayment.confirmedAmount !== null
+                      ? {
+                          groupId: settlementPayment.groupId,
+                          settlementId: settlementPayment.settlementId,
+                          groupName: settlementPayment.groupName,
+                          toUsername: settlementPayment.toUsername,
+                          toName: settlementPayment.toName,
+                          amountPaise: settlementPayment.confirmedAmount,
+                        }
+                      : null
+                  }
+                  onSettlementPaid={handleSettlementPaid}
+                  onCancelSettlement={cancelSettlementPayment}
                 />
               </div>
               <div className="app-col app-col-wide">
@@ -391,7 +479,7 @@ function App() {
               </div>
             </div>
           </>
-        ) : (
+        ) : page === 'budgets' ? (
           <BudgetPage
             budgets={budgets}
             transactions={transactions}
@@ -411,8 +499,20 @@ function App() {
             onBack={() => setPage('dashboard')}
             onResolved={refresh}
           />
+        ) : (
+          <SplitPage currentUsername={user.username} onBack={() => setPage('dashboard')} onPaySettlement={startSettlementPayment} />
         )}
       </main>
+
+      {settlementPayment && settlementPayment.confirmedAmount === null && (
+        <SettlementPayPopup
+          groupName={settlementPayment.groupName}
+          toName={settlementPayment.toName}
+          remainingAmount={settlementPayment.remainingAmount}
+          onConfirm={confirmSettlementAmount}
+          onCancel={cancelSettlementPayment}
+        />
+      )}
 
       {needsPinSetup && (
         <SetPinModal name={user.name} onDone={() => setNeedsPinSetup(false)} />
