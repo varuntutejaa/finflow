@@ -1,5 +1,6 @@
 import type { Account } from '../../api'
 import { formatMoney } from '../../api'
+import { AccountStatementButton } from './AccountStatementButton'
 
 interface Props {
   accounts: Account[]
@@ -45,6 +46,7 @@ export function AccountsPanel({ accounts, loading, balancesVisible, embedded = f
               {balancesVisible ? formatMoney(account.balance) : '••••••'}
             </span>
           </span>
+          {balancesVisible && <AccountStatementButton account={account} />}
         </li>
       ))}
     </ul>

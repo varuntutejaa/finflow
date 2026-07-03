@@ -91,6 +91,12 @@ const transactionColumns = db.prepare("PRAGMA table_info(transactions)").all().m
 if (!transactionColumns.includes("category")) {
   db.exec("ALTER TABLE transactions ADD COLUMN category TEXT NOT NULL DEFAULT 'other'");
 }
+if (!transactionColumns.includes("note")) {
+  db.exec("ALTER TABLE transactions ADD COLUMN note TEXT");
+}
+
+db.exec("CREATE INDEX IF NOT EXISTS idx_transactions_created_at ON transactions(created_at)");
+db.exec("CREATE INDEX IF NOT EXISTS idx_transactions_category ON transactions(category)");
 
 // ---- row -> API JSON shape ----
 
@@ -118,10 +124,13 @@ function toTransactionJSON(row) {
     fromAccountId: row.from_account_id,
     fromAccountName: row.from_account_name,
     fromUsername: row.from_username,
+    fromName: row.from_name,
     toAccountId: row.to_account_id,
     toAccountName: row.to_account_name,
     toUsername: row.to_username,
+    toName: row.to_name,
     category: row.category,
+    note: row.note,
     amount: row.amount,
     status: row.status,
     failureReason: row.failure_reason,
@@ -152,8 +161,8 @@ function toBudgetJSON(row) {
 const TRANSACTION_SELECT = `
   SELECT
     t.*,
-    fa.account_name AS from_account_name, fu.username AS from_username,
-    ta.account_name AS to_account_name, tu.username AS to_username
+    fa.account_name AS from_account_name, fu.username AS from_username, fu.name AS from_name,
+    ta.account_name AS to_account_name, tu.username AS to_username, tu.name AS to_name
   FROM transactions t
   JOIN accounts fa ON fa.id = t.from_account_id
   JOIN users fu ON fu.id = fa.user_id
@@ -290,10 +299,44 @@ export function upsertBudgets(userId, budgets) {
 const updateTransactionCategoryStmt = db.prepare(
   "UPDATE transactions SET category = @category WHERE id = @id AND initiated_by_user_id = @userId"
 );
+const updateTransactionNoteStmt = db.prepare(
+  "UPDATE transactions SET note = @note WHERE id = @id AND initiated_by_user_id = @userId"
+);
+const updateTransactionCategoryAndNoteStmt = db.prepare(
+  "UPDATE transactions SET category = @category, note = @note WHERE id = @id AND initiated_by_user_id = @userId"
+);
 
 export function updateTransactionCategory(userId, transactionId, category) {
   const normalizedCategory = normalizeBudgetCategory(category);
   const result = updateTransactionCategoryStmt.run({ id: transactionId, userId, category: normalizedCategory });
+  if (result.changes === 0) return null;
+  return getTransaction(transactionId, userId);
+}
+
+// Edits a transaction's category and/or note (a free-text description you can
+// attach after the fact — useful for "other" spends or just annotating what
+// something was for). Either field can be omitted to leave it unchanged.
+export function updateTransaction(userId, transactionId, { category, note }) {
+  const hasCategory = category !== undefined;
+  const hasNote = note !== undefined;
+  const normalizedNote = hasNote ? (typeof note === "string" && note.trim() ? note.trim().slice(0, 280) : null) : undefined;
+
+  let result;
+  if (hasCategory && hasNote) {
+    result = updateTransactionCategoryAndNoteStmt.run({
+      id: transactionId,
+      userId,
+      category: normalizeBudgetCategory(category),
+      note: normalizedNote,
+    });
+  } else if (hasCategory) {
+    result = updateTransactionCategoryStmt.run({ id: transactionId, userId, category: normalizeBudgetCategory(category) });
+  } else if (hasNote) {
+    result = updateTransactionNoteStmt.run({ id: transactionId, userId, note: normalizedNote });
+  } else {
+    return getTransaction(transactionId, userId);
+  }
+
   if (result.changes === 0) return null;
   return getTransaction(transactionId, userId);
 }
@@ -651,14 +694,83 @@ export function transferToOwnAccount({ userId, fromAccountId, toAccountId, amoun
   }
 }
 
-export function listTransactions({ userId, accountId }) {
+// Filters are all optional and applied server-side so a large history never
+// has to be shipped to the client just to narrow it down: `search` matches
+// the note, category, counterparty username/name, or account name (acting as
+// the closest thing this app has to a "merchant" match); the rest are plain
+// range/equality filters over date, category, and amount.
+export function listTransactions({
+  userId,
+  accountId,
+  search,
+  category,
+  dateFrom,
+  dateTo,
+  minAmount,
+  maxAmount,
+  direction,
+  status,
+  referenceId,
+} = {}) {
   const owned = "(SELECT id FROM accounts WHERE user_id = @userId)";
   const clauses = [`(t.from_account_id IN ${owned} OR t.to_account_id IN ${owned})`];
-  if (accountId) clauses.push("(t.from_account_id = @accountId OR t.to_account_id = @accountId)");
+  const params = { userId };
+
+  if (accountId) {
+    clauses.push("(t.from_account_id = @accountId OR t.to_account_id = @accountId)");
+    params.accountId = accountId;
+  }
+  if (typeof search === "string" && search.trim()) {
+    clauses.push(`(
+      t.note LIKE @search OR
+      t.category LIKE @search OR
+      t.id LIKE @search OR
+      fu.username LIKE @search OR tu.username LIKE @search OR
+      fu.name LIKE @search OR tu.name LIKE @search OR
+      fa.account_name LIKE @search OR ta.account_name LIKE @search
+    )`);
+    params.search = `%${search.trim()}%`;
+  }
+  if (typeof category === "string" && category.trim()) {
+    clauses.push("t.category = @category");
+    params.category = normalizeBudgetCategory(category);
+  }
+  if (typeof dateFrom === "string" && dateFrom.trim()) {
+    clauses.push("t.created_at >= @dateFrom");
+    params.dateFrom = dateFrom;
+  }
+  if (typeof dateTo === "string" && dateTo.trim()) {
+    clauses.push("t.created_at <= @dateTo");
+    params.dateTo = dateTo;
+  }
+  if (Number.isFinite(minAmount)) {
+    clauses.push("t.amount >= @minAmount");
+    params.minAmount = minAmount;
+  }
+  if (Number.isFinite(maxAmount)) {
+    clauses.push("t.amount <= @maxAmount");
+    params.maxAmount = maxAmount;
+  }
+  // "Sent" = this user's account was the source; "Received" = money came in
+  // from someone else's account (a self-transfer between your own accounts
+  // isn't a "received" payment from another person).
+  if (direction === "sent") {
+    clauses.push(`t.from_account_id IN ${owned}`);
+  } else if (direction === "received") {
+    clauses.push(`t.to_account_id IN ${owned} AND t.from_account_id NOT IN ${owned}`);
+  }
+  if (status === "completed" || status === "failed") {
+    clauses.push("t.status = @status");
+    params.status = status;
+  }
+  if (typeof referenceId === "string" && referenceId.trim()) {
+    clauses.push("(t.id LIKE @referenceId OR t.idempotency_key LIKE @referenceId)");
+    params.referenceId = `%${referenceId.trim()}%`;
+  }
 
   return db
     .prepare(`${TRANSACTION_SELECT} WHERE ${clauses.join(" AND ")} ORDER BY t.created_at DESC`)
-    .all({ userId, accountId: accountId ?? null })
+    .all(params)
     .map(toTransactionJSON);
 }
 

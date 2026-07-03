@@ -9,6 +9,7 @@ import {
   searchUsers,
   transfer,
   selfTransfer,
+  updateTransaction,
 } from '../../api'
 import { PinModal } from '../shared/PinModal'
 
@@ -80,14 +81,6 @@ function formatCategoryLabel(category: string) {
         .join(' ')
 }
 
-function loadCategoryNotes(): Record<string, string> {
-  try {
-    return JSON.parse(localStorage.getItem('finflow_category_notes') ?? '{}') as Record<string, string>
-  } catch {
-    return {}
-  }
-}
-
 export function TransferForm({
   accounts,
   categories,
@@ -111,7 +104,6 @@ export function TransferForm({
   const [error, setError] = useState<string | null>(null)
   const [paymentPopup, setPaymentPopup] = useState<PaymentPopup | null>(null)
   const [pending, setPending] = useState<PendingTransfer | null>(null)
-  const [, setCategoryNotes] = useState<Record<string, string>>(() => loadCategoryNotes())
   const searchBoxRef = useRef<HTMLDivElement>(null)
   const quickAmounts = ['500', '1,000', '2,500', '5,000']
   const defaultAccount = accounts[0] ?? null
@@ -326,12 +318,7 @@ export function TransferForm({
       setCategory('other')
       setCategoryNote('')
       if (transferRequest.kind === 'person' && transferRequest.category === 'other' && categoryNote.trim()) {
-        const note = categoryNote.trim()
-        setCategoryNotes((current) => {
-          const next = { ...current, [transaction.id]: note }
-          localStorage.setItem('finflow_category_notes', JSON.stringify(next))
-          return next
-        })
+        updateTransaction(transaction.id, { note: categoryNote.trim() }).catch(() => {})
       }
       if (transferRequest.kind === 'person' && transferRequest.settlementContext) {
         onSettlementPaid?.(transferRequest.settlementContext, transaction.id, transferRequest.amountCents)

@@ -28,14 +28,30 @@ export interface Transaction {
   fromAccountId: string
   fromAccountName: string
   fromUsername: string
+  fromName: string
   toAccountId: string
   toAccountName: string
   toUsername: string
+  toName: string
   category: string
+  note: string | null
   amount: number
   status: 'completed' | 'failed'
   failureReason: string | null
   createdAt: string
+}
+
+export interface TransactionFilters {
+  accountId?: string
+  search?: string
+  category?: string
+  dateFrom?: string
+  dateTo?: string
+  minAmount?: number
+  maxAmount?: number
+  direction?: 'sent' | 'received'
+  status?: 'completed' | 'failed'
+  referenceId?: string
 }
 
 export interface BudgetSummary {
@@ -211,9 +227,13 @@ export function fetchAccounts(): Promise<Account[]> {
   return request('/api/accounts')
 }
 
-export function fetchTransactions(accountId?: string): Promise<Transaction[]> {
-  const qs = accountId ? `?accountId=${encodeURIComponent(accountId)}` : ''
-  return request(`/api/transactions${qs}`)
+export function fetchTransactions(filters: TransactionFilters = {}): Promise<Transaction[]> {
+  const params = new URLSearchParams()
+  for (const [key, value] of Object.entries(filters)) {
+    if (value !== undefined && value !== '') params.set(key, String(value))
+  }
+  const qs = params.toString()
+  return request(`/api/transactions${qs ? `?${qs}` : ''}`)
 }
 
 export function fetchBudgets(): Promise<{ categories: string[]; budgets: BudgetSummary[] }> {
@@ -252,6 +272,16 @@ export function updateTransactionCategory(transactionId: string, category: strin
   return request(`/api/transactions/${encodeURIComponent(transactionId)}/category`, {
     method: 'PATCH',
     body: JSON.stringify({ category }),
+  })
+}
+
+export function updateTransaction(
+  transactionId: string,
+  input: { category?: string; note?: string | null }
+): Promise<Transaction> {
+  return request(`/api/transactions/${encodeURIComponent(transactionId)}`, {
+    method: 'PATCH',
+    body: JSON.stringify(input),
   })
 }
 

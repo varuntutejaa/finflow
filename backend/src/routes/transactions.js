@@ -9,6 +9,7 @@ import {
   TransferError,
   isValidBudgetCategoryName,
   updateTransactionCategory,
+  updateTransaction,
 } from "../config/database.js";
 import { requireAuth, checkPinAuthorization } from "../services/auth.js";
 
@@ -187,9 +188,29 @@ router.post("/self-transfer", enforceTransferRateLimit, (req, res) => {
   }
 });
 
+const stringParam = (value) => (typeof value === "string" && value.trim() ? value : undefined);
+const numberParam = (value) => {
+  if (typeof value !== "string" || value.trim() === "") return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+};
+
 router.get("/", (req, res) => {
-  const accountId = typeof req.query.accountId === "string" ? req.query.accountId : undefined;
-  res.json(listTransactions({ userId: req.userId, accountId }));
+  res.json(
+    listTransactions({
+      userId: req.userId,
+      accountId: stringParam(req.query.accountId),
+      search: stringParam(req.query.search),
+      category: stringParam(req.query.category),
+      dateFrom: stringParam(req.query.dateFrom),
+      dateTo: stringParam(req.query.dateTo),
+      minAmount: numberParam(req.query.minAmount),
+      maxAmount: numberParam(req.query.maxAmount),
+      direction: stringParam(req.query.direction),
+      status: stringParam(req.query.status),
+      referenceId: stringParam(req.query.referenceId),
+    })
+  );
 });
 
 router.patch("/:id/category", (req, res) => {
@@ -201,6 +222,29 @@ router.patch("/:id/category", (req, res) => {
   }
 
   const transaction = updateTransactionCategory(req.userId, req.params.id, category);
+  if (!transaction) {
+    return res.status(404).json({ error: { code: "TRANSACTION_NOT_FOUND", message: "Transaction not found" } });
+  }
+  res.json(transaction);
+});
+
+// General edit — lets a user categorize and annotate a transaction after the
+// fact (either field is optional, so this also covers "just add a note").
+router.patch("/:id", (req, res) => {
+  const { category, note } = req.body ?? {};
+  if (category !== undefined && !isValidBudgetCategoryName(category)) {
+    return res.status(400).json({
+      error: { code: "INVALID_CATEGORY", message: "category must be a valid budgeting category name" },
+    });
+  }
+  if (note !== undefined && note !== null && typeof note !== "string") {
+    return res.status(400).json({ error: { code: "INVALID_NOTE", message: "note must be a string" } });
+  }
+  if (typeof note === "string" && note.length > 280) {
+    return res.status(400).json({ error: { code: "INVALID_NOTE", message: "note must be 280 characters or fewer" } });
+  }
+
+  const transaction = updateTransaction(req.userId, req.params.id, { category, note });
   if (!transaction) {
     return res.status(404).json({ error: { code: "TRANSACTION_NOT_FOUND", message: "Transaction not found" } });
   }

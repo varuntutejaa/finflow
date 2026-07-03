@@ -9,14 +9,6 @@ interface Props {
   onResolved: () => void
 }
 
-function loadCategoryNotes(): Record<string, string> {
-  try {
-    return JSON.parse(localStorage.getItem('finflow_category_notes') ?? '{}') as Record<string, string>
-  } catch {
-    return {}
-  }
-}
-
 function titleCase(value: string) {
   return value
     .split(/\s+/)
@@ -32,7 +24,6 @@ export function UnresolvedTransactionsPanel({ transactions, currentUsername, cat
   const [selections, setSelections] = useState<Record<string, string>>({})
   const [savingId, setSavingId] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const [categoryNotes] = useState<Record<string, string>>(() => loadCategoryNotes())
   const noteOptions = useMemo(() => {
     const uniqueCategories = [...new Set(categories)].filter((category) => category !== 'other')
     return ['Resolve later', ...uniqueCategories]
@@ -85,7 +76,7 @@ export function UnresolvedTransactionsPanel({ transactions, currentUsername, cat
                 </strong>
                 <span>{new Date(tx.createdAt).toLocaleString()}</span>
                 <span>{formatMoney(tx.amount)}</span>
-                {categoryNotes[tx.id] && <span className="budget-unresolved-note-text">Note: {categoryNotes[tx.id]}</span>}
+                {tx.note && <span className="budget-unresolved-note-text">Note: {tx.note}</span>}
               </div>
 
               <label className="budget-unresolved-note">

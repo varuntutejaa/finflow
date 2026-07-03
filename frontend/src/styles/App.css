@@ -586,6 +586,7 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 10px;
   padding: 16px 32px;
   border-bottom: 1px solid var(--border);
   background: var(--surface);
@@ -596,10 +597,14 @@
   @media (max-width: 700px) {
     padding: 14px 18px;
   }
+
+  @media (max-width: 520px) {
+    flex-wrap: wrap;
+  }
 }
 
 .navbar-tabs {
-  display: inline-flex;
+  display: flex;
   align-items: center;
   gap: 8px;
   padding: 6px;
@@ -607,10 +612,25 @@
   background: var(--bg);
   border: 1px solid var(--border);
   margin: 0 auto;
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: auto;
+  scrollbar-width: none;
+
+  &::-webkit-scrollbar {
+    display: none;
+  }
 
   @media (max-width: 700px) {
     gap: 4px;
     padding: 4px;
+  }
+
+  @media (max-width: 520px) {
+    order: 3;
+    width: 100%;
+    justify-content: center;
+    margin-top: 4px;
   }
 }
 
@@ -618,6 +638,8 @@
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  flex-shrink: 0;
+  white-space: nowrap;
   border: none;
   background: transparent;
   color: var(--text);
@@ -627,6 +649,11 @@
   padding: 6px 14px;
   border-radius: 999px;
   cursor: pointer;
+
+  @media (max-width: 480px) {
+    padding: 6px 10px;
+    font-size: 12.5px;
+  }
 }
 
 .navbar-tab-icon {
@@ -946,6 +973,42 @@
   flex-direction: column;
   gap: 2px;
   min-width: 0;
+  flex: 1;
+}
+
+.account-statement-action {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.account-statement-btn {
+  width: 30px;
+  height: 30px;
+}
+
+.account-statement-btn .payment-spinner {
+  width: 14px;
+  height: 14px;
+  border-color: color-mix(in srgb, currentColor 35%, transparent);
+  border-top-color: currentColor;
+}
+
+.account-statement-btn:hover {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
+}
+
+.account-card-embedded .account-statement-btn {
+  background: rgba(255, 255, 255, 0.14);
+  border-color: rgba(255, 255, 255, 0.22);
+  color: #fff;
+}
+
+.account-card-embedded .account-statement-btn:hover {
+  background: rgba(255, 255, 255, 0.24);
+  border-color: rgba(255, 255, 255, 0.4);
+  color: #fff;
 }
 
 .account-name {
@@ -1093,6 +1156,17 @@
   font: inherit;
   min-height: 48px;
   padding: 12px 14px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-h);
+}
+
+.gateway-select {
+  font: inherit;
+  width: 100%;
+  min-height: 44px;
+  padding: 10px 14px;
   border-radius: 12px;
   border: 1px solid var(--border);
   background: var(--bg);
@@ -2403,4 +2477,183 @@
   gap: 12px;
   font-size: 13.5px;
   color: var(--text);
+}
+
+/* ---------- transaction management ---------- */
+
+.tx-filters-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+/* The transaction list scrolls within the page instead of growing it, with
+   the filters column sitting alongside it at its natural (uncapped) height.
+   Only applies once .app-layout is actually side-by-side (>980px) — below
+   that both columns stack as normal full-height blocks, so forcing a fixed
+   row height here would make the second block overlap the first. */
+@media (min-width: 981px) {
+  .tx-page-layout {
+    align-items: stretch;
+    grid-auto-rows: minmax(0, 1fr);
+    height: calc(100vh - 250px);
+    min-height: 420px;
+  }
+
+  .tx-filters-col {
+    align-self: start;
+  }
+
+  .tx-page-layout .app-col-wide {
+    height: 100%;
+    min-height: 0;
+  }
+
+  .tx-page-layout .app-col-wide > .panel {
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+}
+
+.tx-filters-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.tx-filters-row-full {
+  grid-template-columns: 1fr;
+}
+
+.tx-filters-row > label > input[type='text'],
+.tx-filters-row > label > input[type='date'],
+.tx-filters-row > label > input[type='number'] {
+  font: inherit;
+  min-height: 44px;
+  padding: 10px 14px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-h);
+}
+
+.tx-filters-row > label > input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-bg);
+}
+
+.tx-filters-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.tx-amount-presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-height: 44px;
+  align-items: center;
+}
+
+.tx-manage-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: 6px;
+  scrollbar-gutter: stable;
+}
+
+.tx-manage-list::-webkit-scrollbar {
+  width: 8px;
+}
+
+.tx-manage-list::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 22%, var(--border));
+}
+
+.tx-manage-list::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.tx-manage-row {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.96), rgba(243, 247, 251, 0.92));
+}
+
+.tx-manage-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.tx-manage-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.tx-manage-note {
+  font-size: 12.5px;
+  color: var(--text);
+}
+
+.tx-manage-readonly {
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: var(--code-bg);
+  cursor: default;
+}
+
+.tx-manage-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.tx-manage-edit {
+  display: flex;
+  align-items: flex-end;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding-top: 10px;
+  border-top: 1px dashed var(--border);
+}
+
+.tx-manage-edit .gateway-label {
+  flex: 1;
+  min-width: 160px;
+}
+
+.tx-manage-edit input[type='text'] {
+  font: inherit;
+  min-height: 44px;
+  padding: 10px 14px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-h);
+}
+
+.tx-manage-edit-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
