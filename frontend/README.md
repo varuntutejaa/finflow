@@ -19,3 +19,13 @@ React + TypeScript + Vite client for FinFlow.
 npm install
 npm run dev
 ```
+
+Frontend runs on:
+
+- `http://localhost:5173`
+
+When running the full app with Docker from the project root:
+
+```bash
+docker-compose up --build
+```

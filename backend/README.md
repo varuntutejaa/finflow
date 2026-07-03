@@ -19,8 +19,12 @@ npm install
 npm start
 ```
 
+Backend runs on:
+
+- `http://localhost:3000`
+
 From the project root, run both apps with Docker:
 
 ```bash
-docker compose -f backend/compose/docker-compose.yml up --build
+docker-compose up --build
 ```
