@@ -549,6 +549,9 @@ function App() {
         <PinModal
           title="Enter UPI PIN"
           subtitle="Verify your PIN to view your balances"
+          confirmLabel="Check balance"
+          submittingLabel="Verifying…"
+          errorFallback="Could not verify PIN"
           onConfirm={async (pin) => {
             await verifyPin(pin)
             setBalancesVisible(true)

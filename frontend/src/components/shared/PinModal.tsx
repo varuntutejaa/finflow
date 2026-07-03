@@ -4,11 +4,22 @@ import { PinInput } from './PinInput'
 interface Props {
   title: string
   subtitle: string
+  confirmLabel?: string
+  submittingLabel?: string
+  errorFallback?: string
   onConfirm: (pin: string) => Promise<void>
   onCancel: () => void
 }
 
-export function PinModal({ title, subtitle, onConfirm, onCancel }: Props) {
+export function PinModal({
+  title,
+  subtitle,
+  confirmLabel = 'Pay',
+  submittingLabel = 'Processing…',
+  errorFallback = 'Transfer failed',
+  onConfirm,
+  onCancel,
+}: Props) {
   const [pin, setPin] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -27,7 +38,7 @@ export function PinModal({ title, subtitle, onConfirm, onCancel }: Props) {
     setError(null)
     onConfirm(pin)
       .catch((err) => {
-        setError(err instanceof Error ? err.message : 'Transfer failed')
+        setError(err instanceof Error ? err.message : errorFallback)
         setPin('')
       })
       .finally(() => setSubmitting(false))
@@ -67,7 +78,7 @@ export function PinModal({ title, subtitle, onConfirm, onCancel }: Props) {
           onClick={handlePay}
           disabled={pin.length !== 4 || submitting}
         >
-          {submitting ? 'Processing…' : 'Pay'}
+          {submitting ? submittingLabel : confirmLabel}
         </button>
 
         <button type="button" className="link-btn" onClick={onCancel} disabled={submitting}>
