@@ -1,3 +1,6 @@
+# This is a dev-mode compose file (bind-mounts source for hot reload).
+# For normal local runs, prefer the project root's docker-compose.yml instead —
+# `docker-compose up --build` from the repo root.
 services:
   frontend:
     build:
@@ -10,50 +13,26 @@ services:
       - /app/node_modules
     environment:
       - CHOKIDAR_USEPOLLING=true
-    # Ensure frontend restarts if it crashes
     restart: unless-stopped
-    # PARTICIPANT TODO: (Optional) If your frontend depends on the backend starting first, uncomment below:
-    # depends_on:
-    #   - backend
+    depends_on:
+      - backend
 
   backend:
     build:
       context: ../../backend
       dockerfile: Dockerfile
-    # PARTICIPANT TODO: Update the port mapping below once your backend is ready
+    environment:
+      - DATA_DIR=/app/data
     ports:
       - "3000:3000"
     volumes:
       - ../../backend:/app
       - /app/node_modules
-    # Ensure backend restarts if it crashes
+      # SQLite data lives in its own named volume (not just the source bind
+      # mount above) so it survives `docker-compose down` / image rebuilds
+      # even if the bind mount is ever changed or dropped.
+      - backend_data:/app/data
     restart: unless-stopped
-    # PARTICIPANT TODO: (Optional) If you add a database service, uncomment the lines below so the backend configures it
-    # environment:
-    #   - DB_URL=jdbc:postgresql://db:5432/event_platform
-    #   - DB_USER=admin
-    #   - DB_PASS=adminpassword
-    # depends_on:
-    #   - db
 
-  # =======================================================================
-  # PARTICIPANT TODO: (Optional) Database Service Example
-  # =======================================================================
-  # If your project requires a database (SQL, NoSQL, etc.), you can add it here.
-  # Here is an example of adding a PostgreSQL service (you could also use MongoDB, MySQL, etc.):
-  # 
-  # db:
-  #   image: postgres:15-alpine
-  #   container_name: event_db
-  #   environment:
-  #     POSTGRES_USER: admin
-  #     POSTGRES_PASSWORD: adminpassword
-  #     POSTGRES_DB: event_platform
-  #   ports:
-  #     - "5432:5432"
-  #   volumes:
-  #     - db_data:/var/lib/postgresql/data
-
-# PARTICIPANT TODO: (Optional) If you added a database with a volume above, declare the volume here:
-# volumes:
-#   db_data:
+volumes:
+  backend_data:

@@ -6,12 +6,15 @@ import accountsRouter from "./routes/accounts.js";
 import transactionsRouter from "./routes/transactions.js";
 import budgetsRouter from "./routes/budgets.js";
 import groupsRouter from "./routes/groups.js";
+import importsRouter from "./routes/imports.js";
+import analyticsRouter from "./routes/analytics.js";
 
 const app = express();
 const port = process.env.PORT || 3000;
 
 app.use(cors());
-app.use(express.json());
+// Statement imports (base64 PDFs especially) can exceed the 100kb default.
+app.use(express.json({ limit: "15mb" }));
 
 app.get("/health", (req, res) => {
   res.json({ status: "ok" });
@@ -23,6 +26,8 @@ app.use("/api/accounts", accountsRouter);
 app.use("/api/transactions", transactionsRouter);
 app.use("/api/budgets", budgetsRouter);
 app.use("/api/groups", groupsRouter);
+app.use("/api/imports", importsRouter);
+app.use("/api/analytics", analyticsRouter);
 
 app.use((err, req, res, next) => {
   console.error(err);

@@ -357,6 +357,107 @@ export function paySettlement(
   })
 }
 
+export interface ImportedTransaction {
+  id: string
+  source: 'csv' | 'pdf'
+  merchant: string
+  amount: number
+  entryType: 'debit' | 'credit'
+  category: string
+  occurredAt: string
+  rawText: string | null
+  importedAt: string
+  batchId: string | null
+}
+
+export interface ImportResult {
+  imported: ImportedTransaction[]
+  importedCount: number
+  skippedCount: number
+  duplicateCount: number
+  batchId: string
+}
+
+export function importCsvStatement(csvText: string): Promise<ImportResult> {
+  return request('/api/imports/csv', { method: 'POST', body: JSON.stringify({ csvText }) })
+}
+
+export function importPdfStatement(pdfBase64: string): Promise<ImportResult> {
+  return request('/api/imports/pdf', { method: 'POST', body: JSON.stringify({ pdfBase64 }) })
+}
+
+export function fetchImportedTransactions(filters: { category?: string; dateFrom?: string; dateTo?: string } = {}): Promise<
+  ImportedTransaction[]
+> {
+  const params = new URLSearchParams()
+  for (const [key, value] of Object.entries(filters)) {
+    if (value !== undefined && value !== '') params.set(key, String(value))
+  }
+  const qs = params.toString()
+  return request(`/api/imports${qs ? `?${qs}` : ''}`)
+}
+
+export function updateImportedTransactionCategory(id: string, category: string): Promise<ImportedTransaction> {
+  return request(`/api/imports/${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ category }),
+  })
+}
+
+export function deleteImportedTransaction(id: string): Promise<{ success: true }> {
+  return request(`/api/imports/${encodeURIComponent(id)}`, { method: 'DELETE' })
+}
+
+export function rollbackImportBatch(batchId: string): Promise<{ success: true; deletedCount: number }> {
+  return request(`/api/imports/batch/${encodeURIComponent(batchId)}`, { method: 'DELETE' })
+}
+
+export interface CategorySpend {
+  category: string
+  amount: number
+  percent: number
+}
+
+export interface MonthSpend {
+  month: string
+  amount: number
+}
+
+export interface MerchantSpend {
+  merchant: string
+  amount: number
+  count: number
+}
+
+export interface RecurringExpense {
+  merchant: string
+  category: string
+  occurrences: number
+  averageAmount: number
+  lastAmount: number
+  lastOccurredAt: string
+  cadence: 'Monthly' | 'Weekly' | 'Biweekly' | 'Yearly' | 'Recurring'
+}
+
+export interface SpendingAnalytics {
+  totalSpent: number
+  totalCredited: number
+  transactionCount: number
+  byCategory: CategorySpend[]
+  byMonth: MonthSpend[]
+  topMerchants: MerchantSpend[]
+  recurring: RecurringExpense[]
+}
+
+export function fetchSpendingAnalytics(filters: { dateFrom?: string; dateTo?: string } = {}): Promise<SpendingAnalytics> {
+  const params = new URLSearchParams()
+  for (const [key, value] of Object.entries(filters)) {
+    if (value !== undefined && value !== '') params.set(key, String(value))
+  }
+  const qs = params.toString()
+  return request(`/api/analytics/spending${qs ? `?${qs}` : ''}`)
+}
+
 // Money is stored server-side as an integer count of the currency's minor unit
 // (paise for INR). These convert to/from the whole-rupee value shown to users.
 export const MAX_TRANSFER_AMOUNT_PAISE = 50000000

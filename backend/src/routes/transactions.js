@@ -10,6 +10,7 @@ import {
   isValidBudgetCategoryName,
   updateTransactionCategory,
   updateTransaction,
+  checkTransferRateLimit,
 } from "../config/database.js";
 import { requireAuth, checkPinAuthorization } from "../services/auth.js";
 
@@ -20,18 +21,10 @@ const IDEMPOTENCY_KEY_RE = /^[a-zA-Z0-9:_-]{1,128}$/;
 const MAX_TRANSFER_AMOUNT = 50000000;
 const TRANSFER_RATE_LIMIT_WINDOW_MS = 60_000;
 const TRANSFER_RATE_LIMIT_COUNT = 8;
-const transferAttemptsByUser = new Map();
-function pruneAttempts(userId, now) {
-  const attempts = transferAttemptsByUser.get(userId) ?? [];
-  const activeAttempts = attempts.filter((timestamp) => now - timestamp < TRANSFER_RATE_LIMIT_WINDOW_MS);
-  transferAttemptsByUser.set(userId, activeAttempts);
-  return activeAttempts;
-}
 
 function enforceTransferRateLimit(req, res, next) {
-  const now = Date.now();
-  const attempts = pruneAttempts(req.userId, now);
-  if (attempts.length >= TRANSFER_RATE_LIMIT_COUNT) {
+  const allowed = checkTransferRateLimit(req.userId, TRANSFER_RATE_LIMIT_WINDOW_MS, TRANSFER_RATE_LIMIT_COUNT);
+  if (!allowed) {
     return res.status(429).json({
       error: {
         code: "RATE_LIMITED",
@@ -39,8 +32,6 @@ function enforceTransferRateLimit(req, res, next) {
       },
     });
   }
-  attempts.push(now);
-  transferAttemptsByUser.set(req.userId, attempts);
   next();
 }
 

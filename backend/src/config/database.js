@@ -56,11 +56,18 @@ db.exec(`
     UNIQUE(user_id, category)
   );
 
+  CREATE TABLE IF NOT EXISTS transfer_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL REFERENCES users(id),
+    attempted_at INTEGER NOT NULL
+  );
+
   CREATE INDEX IF NOT EXISTS idx_accounts_user ON accounts(user_id);
   CREATE INDEX IF NOT EXISTS idx_transactions_initiator ON transactions(initiated_by_user_id);
   CREATE INDEX IF NOT EXISTS idx_transactions_from ON transactions(from_account_id);
   CREATE INDEX IF NOT EXISTS idx_transactions_to ON transactions(to_account_id);
   CREATE INDEX IF NOT EXISTS idx_budgets_user ON budgets(user_id);
+  CREATE INDEX IF NOT EXISTS idx_transfer_attempts_user ON transfer_attempts(user_id, attempted_at);
 
   CREATE TRIGGER IF NOT EXISTS accounts_balance_nonnegative_insert
   BEFORE INSERT ON accounts
@@ -239,6 +246,30 @@ const getAccountRawStmt = db.prepare("SELECT * FROM accounts WHERE id = ?");
 const listAccountsByUserStmt = db.prepare(
   "SELECT * FROM accounts WHERE user_id = ? ORDER BY created_at ASC"
 );
+
+const pruneTransferAttemptsStmt = db.prepare("DELETE FROM transfer_attempts WHERE user_id = @userId AND attempted_at < @cutoff");
+const countTransferAttemptsStmt = db.prepare(
+  "SELECT COUNT(*) AS count FROM transfer_attempts WHERE user_id = @userId AND attempted_at >= @cutoff"
+);
+const insertTransferAttemptStmt = db.prepare("INSERT INTO transfer_attempts (user_id, attempted_at) VALUES (@userId, @now)");
+
+// Backed by SQLite (not an in-memory Map) so the limit survives a server
+// restart and stays correct if this ever runs as more than one instance
+// sharing the same database file — an in-process counter would silently
+// reset or under-count in either case.
+const recordTransferAttemptTxn = db.transaction((userId, windowMs, maxCount) => {
+  const now = Date.now();
+  const cutoff = now - windowMs;
+  pruneTransferAttemptsStmt.run({ userId, cutoff });
+  const { count } = countTransferAttemptsStmt.get({ userId, cutoff });
+  if (count >= maxCount) return false;
+  insertTransferAttemptStmt.run({ userId, now });
+  return true;
+});
+
+export function checkTransferRateLimit(userId, windowMs, maxCount) {
+  return recordTransferAttemptTxn(userId, windowMs, maxCount);
+}
 
 export function isValidBudgetCategoryName(category) {
   return typeof category === "string" && BUDGET_CATEGORY_NAME_RE.test(category.trim());

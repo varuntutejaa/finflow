@@ -1864,6 +1864,40 @@
   flex-wrap: wrap;
 }
 
+.tx-ledger-filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.tx-ledger-filters .gateway-select {
+  width: auto;
+  min-height: 38px;
+  padding: 6px 12px;
+  font-size: 13px;
+}
+
+.tx-ledger-id-search {
+  font: inherit;
+  font-size: 13px;
+  min-height: 38px;
+  min-width: 160px;
+  flex: 1;
+  padding: 6px 12px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-h);
+}
+
+.tx-ledger-id-search:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-bg);
+}
+
 .tx-panel-count {
   display: inline-flex;
   align-items: center;
@@ -2007,6 +2041,11 @@
 .status-failed {
   background: var(--danger-bg);
   color: var(--danger);
+}
+
+.status-imported {
+  background: color-mix(in srgb, var(--accent-bg) 65%, white);
+  color: var(--accent);
 }
 
 /* ---------- pin input ---------- */
@@ -2656,4 +2695,195 @@
   display: flex;
   align-items: center;
   gap: 8px;
+}
+
+/* ---------- analytics ---------- */
+
+.analytics-upload-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  margin: 10px 0;
+}
+
+.analytics-undo-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.analytics-stat-row {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 14px;
+
+  @media (max-width: 900px) {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  @media (max-width: 560px) {
+    grid-template-columns: 1fr;
+  }
+}
+
+.analytics-stat-tile {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 16px 18px;
+  border-radius: 16px;
+  border: 1px solid var(--border);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.96), rgba(243, 247, 251, 0.92));
+}
+
+.analytics-stat-tile strong {
+  font-size: 24px;
+  color: var(--text-h);
+}
+
+.analytics-rank {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: var(--code-bg);
+  color: var(--text-h);
+  font-size: 12.5px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+/* Category bar chart — one thin horizontal bar per category, direct-labeled
+   with a swatch (acts as the legend), rounded data-end, hover tooltip. */
+.bar-chart {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.bar-chart-row {
+  display: grid;
+  grid-template-columns: 132px 1fr 88px;
+  align-items: center;
+  gap: 12px;
+
+  @media (max-width: 560px) {
+    grid-template-columns: 100px 1fr 72px;
+  }
+}
+
+.bar-chart-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-h);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.bar-chart-swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+
+.bar-chart-track {
+  position: relative;
+  height: 10px;
+  border-radius: 999px;
+  background: var(--code-bg);
+}
+
+.bar-chart-fill {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  transition: opacity 0.12s ease;
+}
+
+.bar-chart-value {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.bar-chart-tooltip {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  padding: 4px 9px;
+  border-radius: 8px;
+  background: var(--text-h);
+  color: #fff;
+  font-size: 11.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  box-shadow: var(--shadow-sm);
+  pointer-events: none;
+  z-index: 5;
+}
+
+/* Monthly trend — thin vertical bars, single sequential hue (one series),
+   rounded top data-end, hover tooltip above the bar. */
+.trend-chart {
+  display: flex;
+  align-items: flex-end;
+  gap: 14px;
+  height: 200px;
+  padding-top: 28px;
+}
+
+.trend-chart-col {
+  position: relative;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  height: 100%;
+}
+
+.trend-chart-track {
+  flex: 1;
+  width: 100%;
+  max-width: 40px;
+  display: flex;
+  align-items: flex-end;
+}
+
+.trend-chart-bar {
+  width: 100%;
+  border-radius: 6px 6px 2px 2px;
+  transition: opacity 0.12s ease;
+}
+
+.trend-chart-label {
+  font-size: 11.5px;
+  color: var(--text);
+  white-space: nowrap;
+}
+
+.trend-chart-tooltip {
+  position: absolute;
+  top: 0;
+  padding: 4px 9px;
+  border-radius: 8px;
+  background: var(--text-h);
+  color: #fff;
+  font-size: 11.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  box-shadow: var(--shadow-sm);
+  pointer-events: none;
+  z-index: 5;
 }

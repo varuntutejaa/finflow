@@ -9,7 +9,7 @@ Node/Express API for FinFlow.
 - `src/services/` - shared backend services
 - `src/config/` - database setup and data access
 - `data/` - local SQLite database files
-- `compose/` - Docker Compose setup for frontend and backend
+- `compose/` - alternate dev-mode Docker Compose setup (hot-reload bind mounts); the root `docker-compose.yml` is the one to use for a normal local run
 - `docs/` - archived project notes
 
 ## Run

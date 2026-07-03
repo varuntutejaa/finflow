@@ -6,6 +6,7 @@ import { AuthForm } from './components/auth/AuthForm'
 import { BudgetPage } from './components/budgets/BudgetPage'
 import { SplitPage } from './components/split/SplitPage'
 import { TransactionsPage } from './components/transactions/TransactionsPage'
+import { AnalyticsPage } from './components/analytics/AnalyticsPage'
 import { SettlementPayPopup } from './components/split/SettlementPayPopup'
 import { SetPinModal } from './components/auth/SetPinModal'
 import { PinModal } from './components/shared/PinModal'
@@ -159,7 +160,7 @@ function App() {
   const [loadError, setLoadError] = useState<string | null>(null)
   const [balancesVisible, setBalancesVisible] = useState(false)
   const [revealingBalances, setRevealingBalances] = useState(false)
-  const [page, setPage] = useState<'dashboard' | 'budgets' | 'split' | 'history'>('dashboard')
+  const [page, setPage] = useState<'dashboard' | 'budgets' | 'split' | 'history' | 'analytics'>('dashboard')
   const [budgetAlert, setBudgetAlert] = useState<{ category: string; status: 'warning' | 'exceeded'; utilizationPercent: number } | null>(
     null
   )
@@ -373,6 +374,14 @@ function App() {
           </button>
           <button
             type="button"
+            className={`navbar-tab navbar-tab-split${page === 'split' ? ' navbar-tab-active' : ''}`}
+            onClick={() => setPage('split')}
+            aria-pressed={page === 'split'}
+          >
+            Split
+          </button>
+          <button
+            type="button"
             className={`navbar-tab navbar-tab-pay${page === 'dashboard' ? ' navbar-tab-active' : ''}`}
             onClick={() => setPage('dashboard')}
             aria-pressed={page === 'dashboard'}
@@ -382,19 +391,19 @@ function App() {
           </button>
           <button
             type="button"
-            className={`navbar-tab navbar-tab-split${page === 'split' ? ' navbar-tab-active' : ''}`}
-            onClick={() => setPage('split')}
-            aria-pressed={page === 'split'}
-          >
-            Split
-          </button>
-          <button
-            type="button"
             className={`navbar-tab navbar-tab-history${page === 'history' ? ' navbar-tab-active' : ''}`}
             onClick={() => setPage('history')}
             aria-pressed={page === 'history'}
           >
             History
+          </button>
+          <button
+            type="button"
+            className={`navbar-tab navbar-tab-analytics${page === 'analytics' ? ' navbar-tab-active' : ''}`}
+            onClick={() => setPage('analytics')}
+            aria-pressed={page === 'analytics'}
+          >
+            Analytics
           </button>
         </div>
         <div className="navbar-user">
@@ -510,13 +519,15 @@ function App() {
           />
         ) : page === 'split' ? (
           <SplitPage currentUsername={user.username} onBack={() => setPage('dashboard')} onPaySettlement={startSettlementPayment} />
-        ) : (
+        ) : page === 'history' ? (
           <TransactionsPage
             accounts={accounts}
             categories={budgetCategories}
             currentUsername={user.username}
             onBack={() => setPage('dashboard')}
           />
+        ) : (
+          <AnalyticsPage onBack={() => setPage('dashboard')} />
         )}
       </main>
 
