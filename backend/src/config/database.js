@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { randomUUID } from "crypto";
+import { randomInt, randomUUID } from "crypto";
 import fs from "fs";
 import path from "path";
 
@@ -12,6 +12,7 @@ fs.mkdirSync(dataDir, { recursive: true });
 const db = new Database(path.join(dataDir, "finflow.db"));
 db.pragma("journal_mode = WAL");
 db.pragma("foreign_keys = ON");
+db.pragma("busy_timeout = 5000");
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS users (
@@ -56,7 +57,19 @@ db.exec(`
     UNIQUE(user_id, category)
   );
 
+  CREATE TABLE IF NOT EXISTS budget_deleted_presets (
+    user_id TEXT NOT NULL REFERENCES users(id),
+    category TEXT NOT NULL,
+    PRIMARY KEY (user_id, category)
+  );
+
   CREATE TABLE IF NOT EXISTS transfer_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL REFERENCES users(id),
+    attempted_at INTEGER NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS failed_pin_attempts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id TEXT NOT NULL REFERENCES users(id),
     attempted_at INTEGER NOT NULL
@@ -68,6 +81,7 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_transactions_to ON transactions(to_account_id);
   CREATE INDEX IF NOT EXISTS idx_budgets_user ON budgets(user_id);
   CREATE INDEX IF NOT EXISTS idx_transfer_attempts_user ON transfer_attempts(user_id, attempted_at);
+  CREATE INDEX IF NOT EXISTS idx_failed_pin_attempts_user ON failed_pin_attempts(user_id, attempted_at);
 
   CREATE TRIGGER IF NOT EXISTS accounts_balance_nonnegative_insert
   BEFORE INSERT ON accounts
@@ -101,9 +115,45 @@ if (!transactionColumns.includes("category")) {
 if (!transactionColumns.includes("note")) {
   db.exec("ALTER TABLE transactions ADD COLUMN note TEXT");
 }
+if (!transactionColumns.includes("reference_number")) {
+  db.exec("ALTER TABLE transactions ADD COLUMN reference_number TEXT");
+}
+if (!transactionColumns.includes("is_auto_mandate")) {
+  db.exec("ALTER TABLE transactions ADD COLUMN is_auto_mandate INTEGER NOT NULL DEFAULT 0");
+}
 
 db.exec("CREATE INDEX IF NOT EXISTS idx_transactions_created_at ON transactions(created_at)");
 db.exec("CREATE INDEX IF NOT EXISTS idx_transactions_category ON transactions(category)");
+db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_transactions_reference_number ON transactions(reference_number)");
+
+// A short 6-digit reference number shown in the UI alongside every
+// transaction, distinct from the internal UUID `id`. Retries on the rare
+// collision against the unique index above.
+const checkReferenceNumberStmt = db.prepare("SELECT 1 FROM transactions WHERE reference_number = ?");
+export function generateReferenceNumber() {
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const candidate = String(randomInt(100000, 1000000));
+    if (!checkReferenceNumberStmt.get(candidate)) return candidate;
+  }
+  throw new Error("Could not generate a unique transaction reference number");
+}
+
+// Backfill reference numbers for transactions that existed before this
+// column did — otherwise every pre-migration row would show a blank
+// reference in the UI forever.
+const legacyTransactionIds = db
+  .prepare("SELECT id FROM transactions WHERE reference_number IS NULL")
+  .all()
+  .map((row) => row.id);
+if (legacyTransactionIds.length > 0) {
+  const backfillReferenceNumberStmt = db.prepare("UPDATE transactions SET reference_number = @referenceNumber WHERE id = @id");
+  const backfillTxn = db.transaction((ids) => {
+    for (const id of ids) {
+      backfillReferenceNumberStmt.run({ id, referenceNumber: generateReferenceNumber() });
+    }
+  });
+  backfillTxn(legacyTransactionIds);
+}
 
 // ---- row -> API JSON shape ----
 
@@ -127,6 +177,7 @@ function toTransactionJSON(row) {
   if (!row) return row;
   return {
     id: row.id,
+    referenceNumber: row.reference_number,
     idempotencyKey: row.idempotency_key,
     fromAccountId: row.from_account_id,
     fromAccountName: row.from_account_name,
@@ -141,6 +192,7 @@ function toTransactionJSON(row) {
     amount: row.amount,
     status: row.status,
     failureReason: row.failure_reason,
+    isAutoMandate: Boolean(row.is_auto_mandate),
     createdAt: row.created_at,
   };
 }
@@ -152,8 +204,8 @@ function toBudgetJSON(row) {
     category: row.category,
     monthlyLimit: row.monthly_limit,
     spent: row.spent,
-    remaining: Math.max(row.monthly_limit - row.spent, 0),
-    utilizationPercent: row.monthly_limit === 0 ? 0 : Math.min(Math.round((row.spent / row.monthly_limit) * 100), 999),
+    remaining: row.monthly_limit - row.spent,
+    utilizationPercent: row.monthly_limit === 0 ? (row.spent > 0 ? 999 : 0) : Math.min(Math.round((row.spent / row.monthly_limit) * 100), 999),
     thresholdPercent: row.threshold_percent,
     status:
       row.spent > row.monthly_limit
@@ -209,6 +261,22 @@ const setUserPinStmt = db.prepare("UPDATE users SET upi_pin_hash = ? WHERE id = 
 
 export function setUserPin(userId, upiPinHash) {
   setUserPinStmt.run(upiPinHash, userId);
+}
+
+// Signup now collects a PIN up front, but accounts created before that
+// change have no PIN set at all and would otherwise be locked out of every
+// PIN-gated action. Takes the hashing function as a parameter instead of
+// importing services/auth.js directly, since that module already imports
+// from here (would otherwise be a circular import).
+export function backfillMissingPins(hashPin, defaultPin) {
+  const rows = db.prepare("SELECT id FROM users WHERE upi_pin_hash IS NULL").all();
+  if (rows.length === 0) return 0;
+  const hash = hashPin(defaultPin);
+  const txn = db.transaction((ids) => {
+    for (const id of ids) setUserPinStmt.run(hash, id);
+  });
+  txn(rows.map((r) => r.id));
+  return rows.length;
 }
 
 // Includes the requesting user in results (labeled by the caller) so
@@ -271,6 +339,29 @@ export function checkTransferRateLimit(userId, windowMs, maxCount) {
   return recordTransferAttemptTxn(userId, windowMs, maxCount);
 }
 
+// ---- PIN lockout ----
+// Every wrong-PIN attempt (on any PIN-gated action — transfer, self-transfer,
+// balance reveal, recurring setup) is recorded here; a correct PIN clears the
+// whole streak. checkPinAuthorization (services/auth.js) is what actually
+// decides when this adds up to a lockout.
+const insertFailedPinAttemptStmt = db.prepare("INSERT INTO failed_pin_attempts (user_id, attempted_at) VALUES (?, ?)");
+const listFailedPinAttemptsStmt = db.prepare(
+  "SELECT attempted_at FROM failed_pin_attempts WHERE user_id = ? ORDER BY attempted_at DESC"
+);
+const clearFailedPinAttemptsStmt = db.prepare("DELETE FROM failed_pin_attempts WHERE user_id = ?");
+
+export function recordFailedPinAttempt(userId) {
+  insertFailedPinAttemptStmt.run(userId, Date.now());
+}
+
+export function listFailedPinAttempts(userId) {
+  return listFailedPinAttemptsStmt.all(userId).map((row) => row.attempted_at);
+}
+
+export function clearFailedPinAttempts(userId) {
+  clearFailedPinAttemptsStmt.run(userId);
+}
+
 export function isValidBudgetCategoryName(category) {
   return typeof category === "string" && BUDGET_CATEGORY_NAME_RE.test(category.trim());
 }
@@ -280,14 +371,18 @@ export function normalizeBudgetCategory(category) {
   return category.trim().toLowerCase().replace(/\s+/g, " ");
 }
 
+const listDeletedPresetsStmt = db.prepare("SELECT category FROM budget_deleted_presets WHERE user_id = ?");
+
 export function listBudgetCategories(userId) {
   if (!userId) return [...BUDGET_CATEGORIES];
+  const deletedPresets = new Set(listDeletedPresetsStmt.all(userId).map((row) => row.category));
+  const activePresets = BUDGET_CATEGORIES.filter((category) => !deletedPresets.has(category));
   const customCategories = db
     .prepare("SELECT DISTINCT category FROM budgets WHERE user_id = ? ORDER BY category ASC")
     .all(userId)
     .map((row) => row.category)
     .filter((category) => !BUDGET_CATEGORIES.includes(category));
-  return [...BUDGET_CATEGORIES, ...customCategories];
+  return [...activePresets, ...customCategories];
 }
 
 export function listAccounts(userId) {
@@ -310,16 +405,22 @@ export function listBudgets(userId) {
   return listBudgetRowsStmt.all(userId).map(toBudgetJSON);
 }
 
+const deleteDeletedPresetStmt = db.prepare(
+  "DELETE FROM budget_deleted_presets WHERE user_id = ? AND category = ?"
+);
+
 export function upsertBudgets(userId, budgets) {
   const txn = db.transaction((items) => {
     for (const budget of items) {
+      const normalizedCategory = normalizeBudgetCategory(budget.category);
       upsertBudgetStmt.run({
         id: randomUUID(),
         userId,
-        category: normalizeBudgetCategory(budget.category),
+        category: normalizedCategory,
         monthlyLimit: budget.monthlyLimit,
         thresholdPercent: budget.thresholdPercent ?? 80,
       });
+      deleteDeletedPresetStmt.run(userId, normalizedCategory);
     }
   });
 
@@ -372,12 +473,32 @@ export function updateTransaction(userId, transactionId, { category, note }) {
   return getTransaction(transactionId, userId);
 }
 
+const reassignOrphanedTransactionsStmt = db.prepare(
+  "UPDATE transactions SET category = 'other' WHERE initiated_by_user_id = ? AND category = ?"
+);
+
+const insertDeletedPresetStmt = db.prepare(
+  "INSERT OR IGNORE INTO budget_deleted_presets (user_id, category) VALUES (?, ?)"
+);
+
 export function deleteBudgetCategory(userId, category) {
   const normalizedCategory = normalizeBudgetCategory(category);
-  const result = db
-    .prepare("DELETE FROM budgets WHERE user_id = ? AND category = ?")
-    .run(userId, normalizedCategory);
-  return result.changes > 0;
+  const isPreset = BUDGET_CATEGORIES.includes(normalizedCategory);
+  const txn = db.transaction(() => {
+    const result = db
+      .prepare("DELETE FROM budgets WHERE user_id = ? AND category = ?")
+      .run(userId, normalizedCategory);
+    if (result.changes > 0 && normalizedCategory !== "other") {
+      reassignOrphanedTransactionsStmt.run(userId, normalizedCategory);
+    }
+    // Presets are otherwise hardcoded into every user's category list, so
+    // deleting one only sticks if we also remember it was explicitly removed.
+    if (isPreset) {
+      insertDeletedPresetStmt.run(userId, normalizedCategory);
+    }
+    return result.changes > 0 || isPreset;
+  });
+  return txn();
 }
 
 // ---- transactions / transfers ----
@@ -389,8 +510,8 @@ const creditAccountStmt = db.prepare(
   "UPDATE accounts SET balance = balance + @amount WHERE id = @accountId"
 );
 const insertTransactionStmt = db.prepare(`
-  INSERT INTO transactions (id, initiated_by_user_id, idempotency_key, from_account_id, to_account_id, category, amount, status, failure_reason)
-  VALUES (@id, @userId, @idempotencyKey, @fromAccountId, @toAccountId, @category, @amount, @status, @failureReason)
+  INSERT INTO transactions (id, reference_number, initiated_by_user_id, idempotency_key, from_account_id, to_account_id, category, amount, status, failure_reason, note, is_auto_mandate)
+  VALUES (@id, @referenceNumber, @userId, @idempotencyKey, @fromAccountId, @toAccountId, @category, @amount, @status, @failureReason, @note, @isAutoMandate)
 `);
 const getTransactionRawStmt = db.prepare(`${TRANSACTION_SELECT} WHERE t.id = ?`);
 const getTransactionByIdempotencyKeyStmt = db.prepare(
@@ -398,10 +519,13 @@ const getTransactionByIdempotencyKeyStmt = db.prepare(
 );
 const listBudgetRowsStmt = db.prepare(`
   WITH month_bounds AS (
+    -- Month boundaries are computed in IST (UTC+5:30): shift 'now' into IST
+    -- wall-clock numberspace, snap to the start of that month, then shift back
+    -- to true UTC so the bounds compare correctly against created_at (UTC).
     SELECT
-      strftime('%Y-%m', 'now') AS month_key,
-      strftime('%Y-%m-01T00:00:00.000Z', 'now') AS month_start,
-      strftime('%Y-%m-01T00:00:00.000Z', 'now', '+1 month') AS month_end
+      strftime('%Y-%m', 'now', '+5 hours', '+30 minutes') AS month_key,
+      strftime('%Y-%m-%dT%H:%M:%S.000Z', 'now', '+5 hours', '+30 minutes', 'start of month', '-5 hours', '-30 minutes') AS month_start,
+      strftime('%Y-%m-%dT%H:%M:%S.000Z', 'now', '+5 hours', '+30 minutes', 'start of month', '+1 month', '-5 hours', '-30 minutes') AS month_end
   )
   SELECT
     b.*,
@@ -494,7 +618,8 @@ function resolveDestinationAccountId(userId, fromAccountId, toUsername) {
 // A failed (insufficient-funds) attempt still commits as a history row — only
 // throwing here would roll back that audit record along with everything else.
 const transferTxn = db.transaction(
-  ({ id, userId, idempotencyKey, fromAccountId, toUsername, amount, category }) => {
+  ({ id, userId, idempotencyKey, fromAccountId, toUsername, amount, category, note, isAutoMandate }) => {
+    const referenceNumber = generateReferenceNumber();
     const from = getAccountRawStmt.get(fromAccountId);
     if (!from || from.user_id !== userId) {
       throw new TransferError(404, "ACCOUNT_NOT_FOUND", `Account ${fromAccountId} not found`);
@@ -505,6 +630,7 @@ const transferTxn = db.transaction(
     if (from.balance < amount) {
       insertTransactionStmt.run({
         id,
+        referenceNumber,
         userId,
         idempotencyKey: idempotencyKey ?? null,
         fromAccountId,
@@ -513,6 +639,8 @@ const transferTxn = db.transaction(
         amount,
         status: "failed",
         failureReason: "insufficient_funds",
+        note,
+        isAutoMandate: isAutoMandate ? 1 : 0,
       });
       return getTransactionRawStmt.get(id);
     }
@@ -521,6 +649,7 @@ const transferTxn = db.transaction(
     if (debit.changes !== 1) {
       insertTransactionStmt.run({
         id,
+        referenceNumber,
         userId,
         idempotencyKey: idempotencyKey ?? null,
         fromAccountId,
@@ -529,6 +658,8 @@ const transferTxn = db.transaction(
         amount,
         status: "failed",
         failureReason: "insufficient_funds",
+        note,
+        isAutoMandate: isAutoMandate ? 1 : 0,
       });
       return getTransactionRawStmt.get(id);
     }
@@ -540,6 +671,7 @@ const transferTxn = db.transaction(
 
     insertTransactionStmt.run({
       id,
+      referenceNumber,
       userId,
       idempotencyKey: idempotencyKey ?? null,
       fromAccountId,
@@ -548,13 +680,15 @@ const transferTxn = db.transaction(
       amount,
       status: "completed",
       failureReason: null,
+      note,
+      isAutoMandate: isAutoMandate ? 1 : 0,
     });
 
     return getTransactionRawStmt.get(id);
   }
 );
 
-export function transfer({ userId, fromAccountId, toUsername, amount, idempotencyKey, category }) {
+export function transfer({ userId, fromAccountId, toUsername, amount, idempotencyKey, category, note, isAutoMandate }) {
   if (!Number.isSafeInteger(amount) || amount <= 0) {
     throw new TransferError(400, "INVALID_AMOUNT", "amount must be a positive integer (cents)");
   }
@@ -564,6 +698,7 @@ export function transfer({ userId, fromAccountId, toUsername, amount, idempotenc
 
   const normalizedToUsername = toUsername.trim().toLowerCase();
   const normalizedCategory = normalizeBudgetCategory(category);
+  const normalizedNote = typeof note === "string" && note.trim() ? note.trim().slice(0, 280) : null;
 
   if (idempotencyKey) {
     const existing = getTransactionByIdempotencyKeyStmt.get(idempotencyKey, userId);
@@ -588,6 +723,8 @@ export function transfer({ userId, fromAccountId, toUsername, amount, idempotenc
       toUsername: normalizedToUsername,
       category: normalizedCategory,
       amount,
+      note: normalizedNote,
+      isAutoMandate: Boolean(isAutoMandate),
     });
     if (transaction.status === "failed") {
       throw insufficientFundsError(transaction);
@@ -618,7 +755,8 @@ export function transfer({ userId, fromAccountId, toUsername, amount, idempotenc
 // user's own accounts) — so internal moves never distort a budget.
 const OWN_ACCOUNT_TRANSFER_CATEGORY = "transfer";
 
-const ownAccountTransferTxn = db.transaction(({ id, userId, idempotencyKey, fromAccountId, toAccountId, amount }) => {
+const ownAccountTransferTxn = db.transaction(({ id, userId, idempotencyKey, fromAccountId, toAccountId, amount, note }) => {
+  const referenceNumber = generateReferenceNumber();
   const from = getAccountRawStmt.get(fromAccountId);
   if (!from || from.user_id !== userId) {
     throw new TransferError(404, "ACCOUNT_NOT_FOUND", `Account ${fromAccountId} not found`);
@@ -631,6 +769,7 @@ const ownAccountTransferTxn = db.transaction(({ id, userId, idempotencyKey, from
   if (from.balance < amount) {
     insertTransactionStmt.run({
       id,
+      referenceNumber,
       userId,
       idempotencyKey: idempotencyKey ?? null,
       fromAccountId,
@@ -639,6 +778,8 @@ const ownAccountTransferTxn = db.transaction(({ id, userId, idempotencyKey, from
       amount,
       status: "failed",
       failureReason: "insufficient_funds",
+      note,
+      isAutoMandate: 0,
     });
     return getTransactionRawStmt.get(id);
   }
@@ -647,6 +788,7 @@ const ownAccountTransferTxn = db.transaction(({ id, userId, idempotencyKey, from
   if (debit.changes !== 1) {
     insertTransactionStmt.run({
       id,
+      referenceNumber,
       userId,
       idempotencyKey: idempotencyKey ?? null,
       fromAccountId,
@@ -655,6 +797,8 @@ const ownAccountTransferTxn = db.transaction(({ id, userId, idempotencyKey, from
       amount,
       status: "failed",
       failureReason: "insufficient_funds",
+      note,
+      isAutoMandate: 0,
     });
     return getTransactionRawStmt.get(id);
   }
@@ -663,6 +807,7 @@ const ownAccountTransferTxn = db.transaction(({ id, userId, idempotencyKey, from
 
   insertTransactionStmt.run({
     id,
+    referenceNumber,
     userId,
     idempotencyKey: idempotencyKey ?? null,
     fromAccountId,
@@ -671,12 +816,14 @@ const ownAccountTransferTxn = db.transaction(({ id, userId, idempotencyKey, from
     amount,
     status: "completed",
     failureReason: null,
+    note,
+    isAutoMandate: 0,
   });
 
   return getTransactionRawStmt.get(id);
 });
 
-export function transferToOwnAccount({ userId, fromAccountId, toAccountId, amount, idempotencyKey }) {
+export function transferToOwnAccount({ userId, fromAccountId, toAccountId, amount, idempotencyKey, note }) {
   if (!Number.isSafeInteger(amount) || amount <= 0) {
     throw new TransferError(400, "INVALID_AMOUNT", "amount must be a positive integer (cents)");
   }
@@ -706,8 +853,18 @@ export function transferToOwnAccount({ userId, fromAccountId, toAccountId, amoun
     }
   }
 
+  const normalizedNote = typeof note === "string" && note.trim() ? note.trim().slice(0, 280) : null;
+
   try {
-    const transaction = ownAccountTransferTxn({ id: randomUUID(), userId, idempotencyKey, fromAccountId, toAccountId, amount });
+    const transaction = ownAccountTransferTxn({
+      id: randomUUID(),
+      userId,
+      idempotencyKey,
+      fromAccountId,
+      toAccountId,
+      amount,
+      note: normalizedNote,
+    });
     if (transaction.status === "failed") {
       throw insufficientFundsError(transaction);
     }
@@ -725,12 +882,7 @@ export function transferToOwnAccount({ userId, fromAccountId, toAccountId, amoun
   }
 }
 
-// Filters are all optional and applied server-side so a large history never
-// has to be shipped to the client just to narrow it down: `search` matches
-// the note, category, counterparty username/name, or account name (acting as
-// the closest thing this app has to a "merchant" match); the rest are plain
-// range/equality filters over date, category, and amount.
-export function listTransactions({
+function buildTransactionFilterQuery({
   userId,
   accountId,
   search,
@@ -756,6 +908,7 @@ export function listTransactions({
       t.note LIKE @search OR
       t.category LIKE @search OR
       t.id LIKE @search OR
+      t.reference_number LIKE @search OR
       fu.username LIKE @search OR tu.username LIKE @search OR
       fu.name LIKE @search OR tu.name LIKE @search OR
       fa.account_name LIKE @search OR ta.account_name LIKE @search
@@ -795,14 +948,26 @@ export function listTransactions({
     params.status = status;
   }
   if (typeof referenceId === "string" && referenceId.trim()) {
-    clauses.push("(t.id LIKE @referenceId OR t.idempotency_key LIKE @referenceId)");
+    clauses.push("(t.id LIKE @referenceId OR t.idempotency_key LIKE @referenceId OR t.reference_number LIKE @referenceId)");
     params.referenceId = `%${referenceId.trim()}%`;
   }
 
-  return db
-    .prepare(`${TRANSACTION_SELECT} WHERE ${clauses.join(" AND ")} ORDER BY t.created_at DESC`)
-    .all(params)
-    .map(toTransactionJSON);
+  return { sql: `${TRANSACTION_SELECT} WHERE ${clauses.join(" AND ")} ORDER BY t.created_at DESC`, params };
+}
+
+// Filters are all optional and applied server-side so a large history never
+// has to be shipped to the client just to narrow it down: `search` matches
+// the note, category, counterparty username/name, or account name (acting as
+// the closest thing this app has to a "merchant" match); the rest are plain
+// range/equality filters over date, category, and amount.
+export function listTransactions(filters = {}) {
+  const { sql, params } = buildTransactionFilterQuery(filters);
+  return db.prepare(sql).all(params).map(toTransactionJSON);
+}
+
+export function iterateTransactions(filters = {}) {
+  const { sql, params } = buildTransactionFilterQuery(filters);
+  return db.prepare(sql).iterate(params);
 }
 
 export function getTransaction(id, userId) {

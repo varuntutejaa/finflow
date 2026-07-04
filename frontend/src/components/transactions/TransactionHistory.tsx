@@ -17,11 +17,12 @@ function describe(tx: Transaction, currentUsername: string) {
   const selfTransfer = tx.fromUsername === tx.toUsername
 
   if (selfTransfer) {
-    return { outgoing, label: `${tx.fromAccountName} → ${tx.toAccountName}` }
+    return { outgoing, label: `${tx.fromAccountName} → ${tx.toAccountName}`, username: null }
   }
   return {
     outgoing,
-    label: outgoing ? `To @${tx.toUsername}` : `From @${tx.fromUsername}`,
+    label: outgoing ? `To ${tx.toName}` : `From ${tx.fromName}`,
+    username: outgoing ? tx.toUsername : tx.fromUsername,
   }
 }
 
@@ -129,7 +130,7 @@ export function TransactionHistory({ transactions, currentUsername, loading }: P
       ) : (
         <ul className="tx-list">
           {filtered.map((tx) => {
-            const { outgoing, label } = describe(tx, currentUsername)
+            const { outgoing, label, username } = describe(tx, currentUsername)
             const failed = tx.status === 'failed'
             return (
               <li key={tx.id} className="tx-row">
@@ -138,13 +139,22 @@ export function TransactionHistory({ transactions, currentUsername, loading }: P
                 </span>
                 <span className="tx-main">
                   <span className="tx-label">{label}</span>
+                  {username && <span className="tx-username">@{username}</span>}
                   <span className="tx-time">{new Date(tx.createdAt).toLocaleString()}</span>
+                  {(tx.category || tx.note || tx.isAutoMandate) && (
+                    <span className="tx-meta">
+                      {tx.isAutoMandate && <span className="tx-automandate-tag">Auto mandate</span>}
+                      {tx.category && <span className="tx-category-tag">{tx.category}</span>}
+                      {tx.note && <span className="tx-note">{tx.note}</span>}
+                    </span>
+                  )}
                 </span>
                 <span className="tx-end">
                   <span className={`tx-amount ${failed ? 'tx-amount-failed' : outgoing ? 'tx-amount-out' : 'tx-amount-in'}`}>
                     {failed ? '' : outgoing ? '−' : '+'}
                     {formatMoney(tx.amount)}
                   </span>
+                  {tx.referenceNumber && <span className="tx-ref">#{tx.referenceNumber}</span>}
                   {failed && <span className="status-badge status-failed">failed</span>}
                 </span>
               </li>

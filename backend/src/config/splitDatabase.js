@@ -102,6 +102,22 @@ const insertGroupStmt = db.prepare(
 const insertGroupMemberStmt = db.prepare(
   "INSERT OR IGNORE INTO expense_group_members (group_id, user_id) VALUES (@groupId, @userId)"
 );
+const deleteGroupMemberStmt = db.prepare(
+  "DELETE FROM expense_group_members WHERE group_id = @groupId AND user_id = @userId"
+);
+const memberFinancialHistoryStmt = db.prepare(`
+  SELECT
+    (SELECT COUNT(*) FROM expenses WHERE group_id = @groupId AND paid_by_user_id = @userId) AS paid_expenses,
+    (
+      SELECT COUNT(*) FROM expense_splits s
+      JOIN expenses e ON e.id = s.expense_id
+      WHERE e.group_id = @groupId AND s.user_id = @userId
+    ) AS split_expenses,
+    (
+      SELECT COUNT(*) FROM settlements
+      WHERE group_id = @groupId AND (from_user_id = @userId OR to_user_id = @userId)
+    ) AS settlements
+`);
 
 const createGroupTxn = db.transaction(({ name, createdByUserId, memberUserIds }) => {
   const id = randomUUID();
@@ -313,6 +329,38 @@ export function addGroupMember(groupId, requestingUserId, username) {
   const user = normalized ? findUserByUsername(normalized) : null;
   if (!user) throw new SplitError(404, "MEMBER_NOT_FOUND", `No user found with username "${username}"`);
   insertGroupMemberStmt.run({ groupId, userId: user.id });
+  return getExpenseGroupDetail(groupId, requestingUserId);
+}
+
+export function removeGroupMember(groupId, requestingUserId, username) {
+  requireMembership(groupId, requestingUserId);
+  const group = getGroupRaw(groupId);
+  if (group.created_by_user_id !== requestingUserId) {
+    throw new SplitError(403, "NOT_GROUP_OWNER", "Only the group creator can remove members");
+  }
+
+  const normalized = typeof username === "string" ? username.trim().toLowerCase() : "";
+  const user = normalized ? findUserByUsername(normalized) : null;
+  if (!user) throw new SplitError(404, "MEMBER_NOT_FOUND", `No user found with username "${username}"`);
+  if (user.id === group.created_by_user_id) {
+    throw new SplitError(400, "CANNOT_REMOVE_OWNER", "The group creator cannot be removed");
+  }
+
+  const membership = db
+    .prepare("SELECT 1 FROM expense_group_members WHERE group_id = ? AND user_id = ?")
+    .get(groupId, user.id);
+  if (!membership) throw new SplitError(404, "MEMBER_NOT_FOUND", "That user is not a member of this group");
+
+  const history = memberFinancialHistoryStmt.get({ groupId, userId: user.id });
+  if (history.paid_expenses > 0 || history.split_expenses > 0 || history.settlements > 0) {
+    throw new SplitError(
+      409,
+      "MEMBER_HAS_FINANCIAL_HISTORY",
+      "Settle or recreate the group before removing a member with expenses, splits, or settlements"
+    );
+  }
+
+  deleteGroupMemberStmt.run({ groupId, userId: user.id });
   return getExpenseGroupDetail(groupId, requestingUserId);
 }
 

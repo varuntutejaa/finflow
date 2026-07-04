@@ -1,4 +1,5 @@
 import { Router } from "express";
+import multer from "multer";
 import { PDFParse } from "pdf-parse";
 import {
   parseCsvStatement,
@@ -15,6 +16,14 @@ import { requireAuth } from "../services/auth.js";
 
 const router = Router();
 router.use(requireAuth);
+
+// Streamed straight to memory as multipart/form-data — never buffered as a
+// base64 string inside the JSON body, which would triple the payload size
+// and block the event loop parsing a giant JSON string synchronously.
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 15 * 1024 * 1024 },
+});
 
 function handleImportError(err, res) {
   if (err instanceof ImportError) {
@@ -35,10 +44,24 @@ router.get("/", (req, res) => {
   );
 });
 
-router.post("/csv", (req, res) => {
-  const { csvText } = req.body ?? {};
+function uploadStatementFile(fieldName, invalidCode, maxSizeMessage) {
+  return (req, res, next) => {
+    upload.single(fieldName)(req, res, (err) => {
+      if (err) {
+        const message = err.code === "LIMIT_FILE_SIZE" ? maxSizeMessage : "Could not read the uploaded file";
+        return res.status(400).json({ error: { code: invalidCode, message } });
+      }
+      next();
+    });
+  };
+}
+
+router.post("/csv", uploadStatementFile("csv", "INVALID_CSV", "CSV is too large (max 15MB)"), (req, res) => {
+  // Keep a tiny legacy fallback for older frontend builds, but the normal
+  // production path is multipart/form-data with req.file.
+  const csvText = req.file?.buffer?.toString("utf8") ?? req.body?.csvText;
   if (typeof csvText !== "string" || !csvText.trim()) {
-    return res.status(400).json({ error: { code: "INVALID_CSV", message: "csvText is required" } });
+    return res.status(400).json({ error: { code: "INVALID_CSV", message: "A csv file is required" } });
   }
   try {
     const { rows, skippedCount } = parseCsvStatement(csvText);
@@ -49,21 +72,13 @@ router.post("/csv", (req, res) => {
   }
 });
 
-router.post("/pdf", async (req, res) => {
-  const { pdfBase64 } = req.body ?? {};
-  if (typeof pdfBase64 !== "string" || !pdfBase64.trim()) {
-    return res.status(400).json({ error: { code: "INVALID_PDF", message: "pdfBase64 is required" } });
-  }
-
-  let buffer;
-  try {
-    buffer = Buffer.from(pdfBase64, "base64");
-  } catch {
-    return res.status(400).json({ error: { code: "INVALID_PDF", message: "pdfBase64 could not be decoded" } });
+router.post("/pdf", uploadStatementFile("pdf", "INVALID_PDF", "PDF is too large (max 15MB)"), async (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ error: { code: "INVALID_PDF", message: "A pdf file is required" } });
   }
 
   try {
-    const parser = new PDFParse({ data: new Uint8Array(buffer) });
+    const parser = new PDFParse({ data: new Uint8Array(req.file.buffer) });
     const { text } = await parser.getText();
     await parser.destroy();
 

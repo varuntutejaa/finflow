@@ -1,7 +1,6 @@
 import { useState } from 'react'
 import type { Account } from '../../api'
-import { fetchTransactions } from '../../api'
-import { downloadCsv } from '../../utils/csv'
+import { downloadAccountStatementCsv } from '../../api'
 
 interface Props {
   account: Account
@@ -29,48 +28,7 @@ export function AccountStatementButton({ account }: Props) {
     setDownloading(true)
     setError(null)
     try {
-      // Newest-first from the API — walk backward from the account's current
-      // balance to reconstruct what it was after each past transaction, then
-      // reverse into chronological order for the statement.
-      const transactions = await fetchTransactions({ accountId: account.id })
-      let runningBalance = account.balance
-      const rows: string[][] = []
-
-      for (const tx of transactions) {
-        const balanceAfter = runningBalance
-        const isDebit = tx.fromAccountId === account.id
-        const isCredit = tx.toAccountId === account.id
-        const affectsBalance = tx.status === 'completed'
-        const description = isCredit
-          ? tx.fromUsername === tx.toUsername
-            ? `From ${tx.fromAccountName}`
-            : `From ${tx.fromName} (@${tx.fromUsername})`
-          : tx.fromUsername === tx.toUsername
-            ? `To ${tx.toAccountName}`
-            : `To ${tx.toName} (@${tx.toUsername})`
-
-        rows.push([
-          tx.createdAt,
-          description,
-          tx.category,
-          isDebit && affectsBalance ? (tx.amount / 100).toFixed(2) : '',
-          isCredit && affectsBalance ? (tx.amount / 100).toFixed(2) : '',
-          (balanceAfter / 100).toFixed(2),
-          tx.status,
-        ])
-
-        if (affectsBalance) {
-          if (isDebit) runningBalance += tx.amount
-          if (isCredit) runningBalance -= tx.amount
-        }
-      }
-      rows.reverse()
-
-      downloadCsv(
-        `finflow-${account.accountName.toLowerCase()}-statement-${new Date().toISOString().slice(0, 10)}.csv`,
-        ['Date', 'Description', 'Category', 'Debit (INR)', 'Credit (INR)', 'Balance (INR)', 'Status'],
-        rows
-      )
+      await downloadAccountStatementCsv(account.id)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not generate statement')
     } finally {

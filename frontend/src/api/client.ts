@@ -24,6 +24,7 @@ export interface Account {
 
 export interface Transaction {
   id: string
+  referenceNumber: string | null
   idempotencyKey: string | null
   fromAccountId: string
   fromAccountName: string
@@ -38,6 +39,7 @@ export interface Transaction {
   amount: number
   status: 'completed' | 'failed'
   failureReason: string | null
+  isAutoMandate: boolean
   createdAt: string
 }
 
@@ -136,6 +138,8 @@ export interface GroupDetail {
 export interface ApiError {
   code: string
   message: string
+  unlockAt?: string
+  attemptsRemaining?: number
 }
 
 const BASE_URL = import.meta.env.VITE_API_URL ?? ''
@@ -155,10 +159,14 @@ export function clearToken() {
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const token = getToken()
+  // FormData bodies must NOT get an explicit Content-Type — the browser sets
+  // one itself (with the multipart boundary), and overriding it here would
+  // break the upload.
+  const isFormData = init?.body instanceof FormData
   const res = await fetch(`${BASE_URL}${path}`, {
     ...init,
     headers: {
-      'Content-Type': 'application/json',
+      ...(isFormData ? {} : { 'Content-Type': 'application/json' }),
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
       ...init?.headers,
     },
@@ -176,12 +184,51 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
   if (!res.ok) {
     const error: ApiError = body.error ?? { code: 'UNKNOWN', message: 'Request failed' }
-    const err = new Error(error.message) as Error & { code: string; transaction?: Transaction }
+    const err = new Error(error.message) as Error & {
+      code: string
+      transaction?: Transaction
+      unlockAt?: string
+      attemptsRemaining?: number
+    }
     err.code = error.code
+    err.unlockAt = error.unlockAt
+    err.attemptsRemaining = error.attemptsRemaining
     err.transaction = body.transaction
     throw err
   }
   return body as T
+}
+
+async function downloadFile(path: string) {
+  const token = getToken()
+  const res = await fetch(`${BASE_URL}${path}`, {
+    headers: {
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+  })
+
+  if (!res.ok) {
+    const contentType = res.headers.get('content-type') ?? ''
+    if (contentType.includes('application/json')) {
+      const body = await res.json()
+      const error: ApiError = body.error ?? { code: 'UNKNOWN', message: 'Download failed' }
+      throw new Error(error.message)
+    }
+    throw new Error('Download failed')
+  }
+
+  const blob = await res.blob()
+  const disposition = res.headers.get('content-disposition') ?? ''
+  const filenameMatch = disposition.match(/filename="([^"]+)"/)
+  const filename = filenameMatch?.[1] ?? `finflow-export-${new Date().toISOString().slice(0, 10)}.csv`
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = filename
+  document.body.appendChild(link)
+  link.click()
+  link.remove()
+  URL.revokeObjectURL(url)
 }
 
 export function signup(input: {
@@ -219,6 +266,10 @@ export function verifyPin(pin: string): Promise<{ valid: true }> {
   return request('/api/auth/verify-pin', { method: 'POST', body: JSON.stringify({ pin }) })
 }
 
+export function fetchPinLockoutStatus(): Promise<{ locked: boolean; unlockAt: string | null }> {
+  return request('/api/auth/pin-lockout')
+}
+
 export function searchUsers(query: string): Promise<UserSearchResult[]> {
   return request(`/api/users/search?q=${encodeURIComponent(query)}`)
 }
@@ -234,6 +285,19 @@ export function fetchTransactions(filters: TransactionFilters = {}): Promise<Tra
   }
   const qs = params.toString()
   return request(`/api/transactions${qs ? `?${qs}` : ''}`)
+}
+
+export function downloadTransactionsCsv(filters: TransactionFilters = {}): Promise<void> {
+  const params = new URLSearchParams()
+  for (const [key, value] of Object.entries(filters)) {
+    if (value !== undefined && value !== '') params.set(key, String(value))
+  }
+  const qs = params.toString()
+  return downloadFile(`/api/transactions/export.csv${qs ? `?${qs}` : ''}`)
+}
+
+export function downloadAccountStatementCsv(accountId: string): Promise<void> {
+  return downloadFile(`/api/transactions/accounts/${encodeURIComponent(accountId)}/statement.csv`)
 }
 
 export function fetchBudgets(): Promise<{ categories: string[]; budgets: BudgetSummary[] }> {
@@ -261,6 +325,7 @@ export function selfTransfer(input: {
   amount: number
   idempotencyKey: string
   pin: string
+  note?: string
 }): Promise<{ transaction: Transaction; replayed: boolean; accounts: Account[] }> {
   return request('/api/transactions/self-transfer', {
     method: 'POST',
@@ -292,6 +357,7 @@ export function transfer(input: {
   idempotencyKey: string
   pin: string
   category: string
+  note?: string
 }): Promise<{ transaction: Transaction; replayed: boolean; accounts: Account[] }> {
   return request('/api/transactions/transfer', {
     method: 'POST',
@@ -315,6 +381,12 @@ export function addGroupMember(groupId: string, username: string): Promise<Group
   return request(`/api/groups/${encodeURIComponent(groupId)}/members`, {
     method: 'POST',
     body: JSON.stringify({ username }),
+  })
+}
+
+export function removeGroupMember(groupId: string, username: string): Promise<GroupDetail> {
+  return request(`/api/groups/${encodeURIComponent(groupId)}/members/${encodeURIComponent(username)}`, {
+    method: 'DELETE',
   })
 }
 
@@ -378,12 +450,16 @@ export interface ImportResult {
   batchId: string
 }
 
-export function importCsvStatement(csvText: string): Promise<ImportResult> {
-  return request('/api/imports/csv', { method: 'POST', body: JSON.stringify({ csvText }) })
+export function importCsvStatement(file: File): Promise<ImportResult> {
+  const formData = new FormData()
+  formData.append('csv', file)
+  return request('/api/imports/csv', { method: 'POST', body: formData })
 }
 
-export function importPdfStatement(pdfBase64: string): Promise<ImportResult> {
-  return request('/api/imports/pdf', { method: 'POST', body: JSON.stringify({ pdfBase64 }) })
+export function importPdfStatement(file: File): Promise<ImportResult> {
+  const formData = new FormData()
+  formData.append('pdf', file)
+  return request('/api/imports/pdf', { method: 'POST', body: formData })
 }
 
 export function fetchImportedTransactions(filters: { category?: string; dateFrom?: string; dateTo?: string } = {}): Promise<
@@ -456,6 +532,160 @@ export function fetchSpendingAnalytics(filters: { dateFrom?: string; dateTo?: st
   }
   const qs = params.toString()
   return request(`/api/analytics/spending${qs ? `?${qs}` : ''}`)
+}
+
+export type RecurringFrequency = 'daily' | 'weekly' | 'monthly'
+
+export interface RecurringPayment {
+  id: string
+  fromAccountId: string
+  fromAccountName: string
+  toUsername: string
+  toName: string
+  category: string
+  amount: number
+  frequency: RecurringFrequency
+  nextRunAt: string
+  lastRunAt: string | null
+  lastStatus: 'completed' | 'failed' | null
+  active: boolean
+  createdAt: string
+}
+
+export function fetchRecurringPayments(): Promise<RecurringPayment[]> {
+  return request('/api/recurring')
+}
+
+export function createRecurringPayment(input: {
+  fromAccountId: string
+  toUsername: string
+  amount: number
+  category: string
+  frequency: RecurringFrequency
+  startAt: string
+  pin: string
+}): Promise<RecurringPayment> {
+  return request('/api/recurring', { method: 'POST', body: JSON.stringify(input) })
+}
+
+export function cancelRecurringPayment(id: string): Promise<{ success: true }> {
+  return request(`/api/recurring/${id}`, { method: 'DELETE' })
+}
+
+export type InvestmentType = 'stock' | 'mutual_fund' | 'etf' | 'crypto' | 'gold' | 'other'
+
+export const INVESTMENT_TYPES: InvestmentType[] = ['stock', 'mutual_fund', 'etf', 'crypto', 'gold', 'other']
+
+export interface Investment {
+  id: string
+  name: string
+  platform: string
+  type: InvestmentType
+  quantity: number
+  buyPrice: number
+  currentPrice: number
+  symbol: string | null
+  notes: string | null
+  investedValue: number
+  currentValue: number
+  gainLoss: number
+  gainLossPercent: number
+  createdAt: string
+  updatedAt: string
+}
+
+export interface InvestmentSummary {
+  investedValue: number
+  currentValue: number
+  gainLoss: number
+  gainLossPercent: number
+  holdingCount: number
+}
+
+export interface InvestmentInput {
+  name: string
+  platform?: string
+  type?: InvestmentType
+  quantity: number
+  buyPrice: number
+  currentPrice: number
+  notes?: string
+  symbol?: string
+}
+
+export interface StockSuggestion {
+  name: string
+  symbol: string
+  exchange: string
+}
+
+export interface MutualFundSuggestion {
+  name: string
+  schemeCode: number
+}
+
+export function fetchInvestments(): Promise<{ investments: Investment[]; summary: InvestmentSummary }> {
+  return request('/api/investments')
+}
+
+export function searchStockSuggestions(query: string): Promise<StockSuggestion[]> {
+  return request(`/api/investments/search/stocks?q=${encodeURIComponent(query)}`)
+}
+
+export function searchMutualFundSuggestions(query: string): Promise<MutualFundSuggestion[]> {
+  return request(`/api/investments/search/mutual-funds?q=${encodeURIComponent(query)}`)
+}
+
+export function fetchStockQuote(symbol: string): Promise<{ price: number }> {
+  return request(`/api/investments/quote/stock?symbol=${encodeURIComponent(symbol)}`)
+}
+
+export function fetchMutualFundQuote(schemeCode: number): Promise<{ price: number }> {
+  return request(`/api/investments/quote/mutual-fund?schemeCode=${schemeCode}`)
+}
+
+export function createInvestment(input: InvestmentInput): Promise<Investment> {
+  return request('/api/investments', { method: 'POST', body: JSON.stringify(input) })
+}
+
+export function updateInvestment(id: string, input: Partial<InvestmentInput>): Promise<Investment> {
+  return request(`/api/investments/${id}`, { method: 'PATCH', body: JSON.stringify(input) })
+}
+
+export function deleteInvestment(id: string): Promise<{ success: true }> {
+  return request(`/api/investments/${id}`, { method: 'DELETE' })
+}
+
+export interface RefreshPricesResult {
+  investments: Investment[]
+  summary: InvestmentSummary
+  updatedCount: number
+  unmatchedCount: number
+  unmatched: Array<{ id: string; name: string; reason: string }>
+}
+
+export function refreshInvestmentPrices(): Promise<RefreshPricesResult> {
+  return request('/api/investments/refresh-prices', { method: 'POST' })
+}
+
+export interface ImportInvestmentsResult {
+  investments: Investment[]
+  summary: InvestmentSummary
+  importedCount: number
+  updatedCount: number
+  skippedCount: number
+}
+
+export function importGrowwMutualFundHoldings(file: File): Promise<ImportInvestmentsResult> {
+  const formData = new FormData()
+  formData.append('file', file)
+  return request('/api/investments/import/groww-mf', { method: 'POST', body: formData })
+}
+
+export function importGrowwStockHoldings(file: File): Promise<ImportInvestmentsResult> {
+  const formData = new FormData()
+  formData.append('file', file)
+  return request('/api/investments/import/groww-stocks', { method: 'POST', body: formData })
 }
 
 // Money is stored server-side as an integer count of the currency's minor unit

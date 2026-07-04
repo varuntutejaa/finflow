@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { Account, Transaction } from '../../api'
-import { fetchTransactions, formatMoney, updateTransaction } from '../../api'
-import { downloadCsv } from '../../utils/csv'
+import { downloadTransactionsCsv, fetchTransactions, formatMoney, updateTransaction } from '../../api'
 import { DirectionIcon } from './DirectionIcon'
 
 interface Props {
@@ -81,28 +80,11 @@ const AMOUNT_PRESETS: Array<{ label: string; min: string; max: string }> = [
   { label: '₹5,000+', min: '5000', max: '' },
 ]
 
-function exportTransactionsCsv(transactions: Transaction[], currentUsername: string) {
-  const rows = transactions.map((tx) => [
-    tx.createdAt,
-    describeCounterparty(tx, currentUsername),
-    tx.category,
-    `${tx.fromName} (@${tx.fromUsername})`,
-    `${tx.toName} (@${tx.toUsername})`,
-    (tx.amount / 100).toFixed(2),
-    tx.status,
-    tx.note ?? '',
-  ])
-  downloadCsv(
-    `finflow-transactions-${new Date().toISOString().slice(0, 10)}.csv`,
-    ['Date', 'Description', 'Category', 'From', 'To', 'Amount (INR)', 'Status', 'Note'],
-    rows
-  )
-}
-
 export function TransactionsPage({ accounts, categories, currentUsername, onBack }: Props) {
   const [transactions, setTransactions] = useState<Transaction[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const [exportingCsv, setExportingCsv] = useState(false)
 
   const [search, setSearch] = useState('')
   const [category, setCategory] = useState('')
@@ -215,6 +197,18 @@ export function TransactionsPage({ accounts, categories, currentUsername, onBack
       setError(err instanceof Error ? err.message : 'Could not save changes')
     } finally {
       setSavingEdit(false)
+    }
+  }
+
+  const exportCsv = async () => {
+    setExportingCsv(true)
+    setError(null)
+    try {
+      await downloadTransactionsCsv(filters)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not export transactions')
+    } finally {
+      setExportingCsv(false)
     }
   }
 
@@ -392,10 +386,10 @@ export function TransactionsPage({ accounts, categories, currentUsername, onBack
           <button
             type="button"
             className="secondary-btn"
-            onClick={() => exportTransactionsCsv(transactions, currentUsername)}
-            disabled={transactions.length === 0}
+            onClick={exportCsv}
+            disabled={transactions.length === 0 || exportingCsv}
           >
-            Export CSV
+            {exportingCsv ? 'Exporting...' : 'Export CSV'}
           </button>
         </div>
       </section>
@@ -434,12 +428,16 @@ export function TransactionsPage({ accounts, categories, currentUsername, onBack
                     </span>
                     <div className="tx-manage-main">
                       <strong>{describeCounterparty(tx, currentUsername)}</strong>
-                      <span className="muted">{new Date(tx.createdAt).toLocaleString()}</span>
+                      <span className="muted">
+                        {new Date(tx.createdAt).toLocaleString()}
+                        {tx.referenceNumber && <span className="tx-ref"> · #{tx.referenceNumber}</span>}
+                      </span>
                       {tx.note && !editing && <span className="tx-manage-note">Note: {tx.note}</span>}
                     </div>
                   </div>
 
                   <div className="tx-manage-meta">
+                    {tx.isAutoMandate && <span className="tx-automandate-tag">Auto mandate</span>}
                     <span className="split-expense-split-chip">{titleCase(tx.category)}</span>
                     <span className={`tx-amount ${failed ? 'tx-amount-failed' : outgoing ? 'tx-amount-out' : 'tx-amount-in'}`}>
                       {failed ? '' : outgoing ? '−' : '+'}

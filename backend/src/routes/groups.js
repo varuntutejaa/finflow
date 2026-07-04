@@ -4,6 +4,7 @@ import {
   listExpenseGroups,
   getExpenseGroupDetail,
   addGroupMember,
+  removeGroupMember,
   addExpense,
   generateSettlements,
   markSettlementPaid,
@@ -48,6 +49,14 @@ router.post("/:id/members", (req, res) => {
   const { username } = req.body ?? {};
   try {
     res.json(addGroupMember(req.params.id, req.userId, username));
+  } catch (err) {
+    if (!handleSplitError(err, res)) throw err;
+  }
+});
+
+router.delete("/:id/members/:username", (req, res) => {
+  try {
+    res.json(removeGroupMember(req.params.id, req.userId, req.params.username));
   } catch (err) {
     if (!handleSplitError(err, res)) throw err;
   }

@@ -26,6 +26,7 @@ router.put("/", (req, res) => {
     });
   }
 
+  const seenCategories = new Set();
   for (const budget of budgets) {
     if (
       !budget ||
@@ -45,6 +46,13 @@ router.put("/", (req, res) => {
         error: { code: "INVALID_THRESHOLD", message: "thresholdPercent must be between 1 and 100" },
       });
     }
+    const normalizedCategory = budget.category.trim().toLowerCase();
+    if (seenCategories.has(normalizedCategory)) {
+      return res.status(400).json({
+        error: { code: "DUPLICATE_CATEGORY", message: `Category "${budget.category}" is listed more than once` },
+      });
+    }
+    seenCategories.add(normalizedCategory);
   }
 
   // Order matters: upsert first so the category list computed below reflects

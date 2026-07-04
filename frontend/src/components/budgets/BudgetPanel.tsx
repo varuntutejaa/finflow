@@ -24,6 +24,17 @@ function normalizeCategory(value: string) {
   return value.trim().toLowerCase().replace(/\s+/g, ' ')
 }
 
+const MONTH_NAMES = [
+  'January', 'February', 'March', 'April', 'May', 'June',
+  'July', 'August', 'September', 'October', 'November', 'December',
+]
+
+function formatMonthKey(monthKey: string) {
+  const [year, month] = monthKey.split('-').map(Number)
+  const name = MONTH_NAMES[(month ?? 1) - 1] ?? monthKey
+  return `${name} ${year}`
+}
+
 export function BudgetPanel({
   budgets,
   categories,
@@ -39,14 +50,15 @@ export function BudgetPanel({
   const [saving, setSaving] = useState(false)
   const [deletingCategory, setDeletingCategory] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [editMode, setEditMode] = useState(false)
 
   const budgetMap = useMemo(() => {
     return new Map(budgets.map((budget) => [budget.category, budget]))
   }, [budgets])
 
   const presetCategories = BUDGET_CATEGORIES as readonly string[]
-  const customCategories = categories.filter((category) => !presetCategories.includes(category))
   const warningCount = budgets.filter((budget) => budget.status !== 'healthy').length
+  const currentMonthLabel = budgets[0]?.monthKey ? formatMonthKey(budgets[0].monthKey) : null
 
   const handleAddCategory = async () => {
     setError(null)
@@ -97,36 +109,48 @@ export function BudgetPanel({
     }
   }
 
-  const handleSave = async () => {
+  const handleSave = async (): Promise<boolean> => {
     setError(null)
-
-    const payload = categories.map((category) => {
-      const current = budgetMap.get(category)
-      const draftValue = drafts[category]
-      const nextValue =
-        draftValue === undefined || draftValue === '' ? current?.monthlyLimit ?? 0 : Math.round(Number(draftValue) * 100)
-
-      if (!Number.isFinite(nextValue) || nextValue < 0) {
-        throw new Error('Budget amounts must be valid numbers greater than or equal to 0.')
-      }
-
-      return {
-        category,
-        monthlyLimit: nextValue,
-        thresholdPercent: current?.thresholdPercent ?? 80,
-      }
-    })
 
     setSaving(true)
     try {
+      const payload = categories.map((category) => {
+        const current = budgetMap.get(category)
+        const draftValue = drafts[category]
+        const nextValue =
+          draftValue === undefined || draftValue === '' ? current?.monthlyLimit ?? 0 : Math.round(Number(draftValue) * 100)
+
+        if (!Number.isFinite(nextValue) || nextValue < 0) {
+          throw new Error('Budget amounts must be valid numbers greater than or equal to 0.')
+        }
+
+        return {
+          category,
+          monthlyLimit: nextValue,
+          thresholdPercent: current?.thresholdPercent ?? 80,
+        }
+      })
+
       const response = await saveBudgets({ budgets: payload })
       setDrafts({})
       onCategoriesChange(response.categories)
       onSaved(response.budgets, response.categories)
+      return true
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not save budgets')
+      return false
     } finally {
       setSaving(false)
+    }
+  }
+
+  const handleToggleEdit = async () => {
+    if (editMode) {
+      const success = await handleSave()
+      if (success) setEditMode(false)
+    } else {
+      setError(null)
+      setEditMode(true)
     }
   }
 
@@ -145,11 +169,11 @@ export function BudgetPanel({
         className={`budget-card${budget?.status ? ` budget-card-${budget.status}` : ''}`}
       >
         <div className="budget-card-head">
-          <div className="budget-card-title">
-            <strong>{titleCase(category)}</strong>
-            <span>{budget ? `${utilization}% used` : accentLabel}</span>
-          </div>
-          {canDelete && (
+          <strong className="budget-card-name" title={titleCase(category)}>
+            {titleCase(category)}
+          </strong>
+          <span className="budget-card-pct">{budget ? `${utilization}%` : accentLabel}</span>
+          {canDelete && editMode && (
             <button
               type="button"
               className="icon-btn budget-delete-btn"
@@ -175,33 +199,36 @@ export function BudgetPanel({
         </div>
 
         <div className="budget-metrics">
-          <span>Spent: {formatMoney(budget?.spent ?? 0)}</span>
-          <span>Left: {formatMoney(budget?.remaining ?? 0)}</span>
+          <span>Spent {formatMoney(budget?.spent ?? 0)}</span>
+          <span className={`budget-status budget-status-${budget?.status ?? 'healthy'}`}>
+            {budget && budget.remaining < 0
+              ? `Over ${formatMoney(Math.abs(budget.remaining))}`
+              : `Left ${formatMoney(budget?.remaining ?? 0)}`}
+          </span>
         </div>
 
-        <label className="budget-input-row">
-          <span>Monthly limit</span>
-          <div className="budget-input-wrap">
-            <span>₹</span>
-            <input
-              type="number"
-              min="0"
-              step="0.01"
-              value={inputValue}
-              disabled={!budgetingEnabled}
-              onChange={(e) => setDrafts((current) => ({ ...current, [category]: e.target.value }))}
-              placeholder="0.00"
-            />
+        {editMode ? (
+          <label className="budget-input-row">
+            <span>Limit</span>
+            <div className="budget-input-wrap">
+              <span>₹</span>
+              <input
+                type="number"
+                min="0"
+                step="0.01"
+                value={inputValue}
+                disabled={!budgetingEnabled}
+                onChange={(e) => setDrafts((current) => ({ ...current, [category]: e.target.value }))}
+                placeholder="0.00"
+              />
+            </div>
+          </label>
+        ) : (
+          <div className="budget-input-row">
+            <span>Limit</span>
+            <span className="budget-limit-static">{formatMoney(budget?.monthlyLimit ?? 0)}</span>
           </div>
-        </label>
-
-        <p className={`budget-status budget-status-${budget?.status ?? 'healthy'}`}>
-          {budget?.status === 'exceeded'
-            ? 'Budget exceeded this month.'
-            : budget?.status === 'warning'
-              ? 'Approaching monthly limit.'
-              : 'Spending is within limit.'}
-        </p>
+        )}
       </div>
     )
   }
@@ -210,10 +237,17 @@ export function BudgetPanel({
     <section className="panel budget-panel">
       <div className="budget-panel-head">
         <div>
-          <span className="transfer-section-kicker">Smart budgeting</span>
-          <h2>Track the four preset budgets</h2>
+          {currentMonthLabel && <h2 className="budget-month-label">{currentMonthLabel}</h2>}
         </div>
         <div className="budget-panel-head-meta">
+          <button
+            type="button"
+            className="secondary-btn budget-edit-toggle"
+            onClick={handleToggleEdit}
+            disabled={!budgetingEnabled || saving}
+          >
+            {editMode ? (saving ? 'Saving...' : 'Done') : 'Edit'}
+          </button>
           <label className="budget-toggle">
             <input
               type="checkbox"
@@ -231,45 +265,28 @@ export function BudgetPanel({
         </div>
       </div>
 
-      <div className="budget-add-row">
-        <label className="budget-add-field">
-          <span>Add budget category</span>
-          <input
-            type="text"
-            value={newCategory}
-            disabled={!budgetingEnabled}
-            onChange={(e) => setNewCategory(e.target.value)}
-            placeholder="e.g. travel"
-          />
-        </label>
-        <button type="button" className="secondary-btn" onClick={handleAddCategory} disabled={controlsDisabled}>
-          {addingCategory ? 'Adding...' : 'Add category'}
-        </button>
-      </div>
-
-      <div className="budget-section">
-        <div className="budget-section-head">
-          <h3>Preset categories</h3>
-          <span>Four starter categories shown here</span>
-        </div>
-        <div className="budget-grid">{presetCategories.map((category) => renderBudgetCard(category, 'Preset'))}</div>
-      </div>
-
-      {customCategories.length > 0 && (
-        <div className="budget-section">
-          <div className="budget-section-head">
-            <h3>Custom categories</h3>
-            <span>Categories you added</span>
-          </div>
-          <div className="budget-grid">{customCategories.map((category) => renderBudgetCard(category, 'Custom', true))}</div>
+      {editMode && (
+        <div className="budget-add-row">
+          <label className="budget-add-field">
+            <span>Add budget category</span>
+            <input
+              type="text"
+              value={newCategory}
+              disabled={!budgetingEnabled}
+              onChange={(e) => setNewCategory(e.target.value)}
+              placeholder="e.g. travel"
+            />
+          </label>
+          <button type="button" className="secondary-btn" onClick={handleAddCategory} disabled={controlsDisabled}>
+            {addingCategory ? 'Adding...' : 'Add category'}
+          </button>
         </div>
       )}
 
-      <div className="budget-panel-actions">
-        <p className="muted">Budgets reset automatically every new month based on current-month transfer activity.</p>
-        <button type="button" className="primary-btn" onClick={handleSave} disabled={controlsDisabled}>
-          {!budgetingEnabled ? 'Budgeting paused' : saving ? 'Saving...' : 'Save budgets'}
-        </button>
+      <div className="budget-section">
+        <div className="budget-grid">
+          {categories.map((category) => renderBudgetCard(category, presetCategories.includes(category) ? 'Preset' : 'Custom', true))}
+        </div>
       </div>
 
       {error && <p className="form-error">{error}</p>}

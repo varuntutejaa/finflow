@@ -6,14 +6,30 @@ import {
   getUserById,
   getUserRawById,
   setUserPin,
+  backfillMissingPins,
 } from "../config/database.js";
-import { hashPassword, verifyPassword, signToken, requireAuth, checkPinAuthorization } from "../services/auth.js";
+import {
+  hashPassword,
+  verifyPassword,
+  signToken,
+  requireAuth,
+  checkPinAuthorization,
+  getPinLockoutStatus,
+} from "../services/auth.js";
 
 const router = Router();
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const USERNAME_RE = /^[a-zA-Z0-9_]{3,20}$/;
 const PIN_RE = /^\d{4}$/;
+
+// One-time backfill for accounts created before signup collected a PIN —
+// gives every pre-existing account the default "1111" so it isn't locked
+// out of PIN-gated actions. New signups always set their own PIN below.
+const backfilledCount = backfillMissingPins(hashPassword, "1111");
+if (backfilledCount > 0) {
+  console.log(`Backfilled default PIN for ${backfilledCount} existing account(s).`);
+}
 
 router.post("/signup", (req, res) => {
   const { username, email, password, name } = req.body ?? {};
@@ -125,9 +141,20 @@ router.post("/verify-pin", requireAuth, (req, res) => {
 
   const authError = checkPinAuthorization(user, pin);
   if (authError) {
-    return res.status(authError.status).json({ error: { code: authError.code, message: authError.message } });
+    return res.status(authError.status).json({
+      error: {
+        code: authError.code,
+        message: authError.message,
+        unlockAt: authError.unlockAt,
+        attemptsRemaining: authError.attemptsRemaining,
+      },
+    });
   }
   res.json({ valid: true });
+});
+
+router.get("/pin-lockout", requireAuth, (req, res) => {
+  res.json(getPinLockoutStatus(req.userId));
 });
 
 router.get("/me", requireAuth, (req, res) => {

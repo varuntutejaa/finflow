@@ -83,7 +83,11 @@ function splitCsvLine(line) {
 
 function parseAmountToPaise(raw) {
   if (typeof raw !== "string") return null;
-  const cleaned = raw.replace(/[₹,\s]/g, "").replace(/^Rs\.?/i, "").replace(/^INR/i, "");
+  const cleaned = raw
+    .replace(/[₹$€£,\s]/g, "")
+    .replace(/^Rs\.?/i, "")
+    .replace(/^INR/i, "")
+    .replace(/^USD|^EUR|^GBP/i, "");
   const value = Number(cleaned);
   if (!Number.isFinite(value) || value <= 0) return null;
   return Math.round(value * 100);
@@ -197,10 +201,18 @@ export function parseCsvStatement(csvText) {
 // instead of the actual amount.
 const DATE_TOKEN =
   "\\d{1,2}[\\/\\-.]\\d{1,2}[\\/\\-.]\\d{2,4}|\\d{1,2}[\\/\\-.\\s]+[A-Za-z]{3,}[\\/\\-.\\s]+\\d{2,4}|\\d{4}-\\d{2}-\\d{2}";
-const LINE_DATE_RE = new RegExp(`^(${DATE_TOKEN})\\s+(.+)$`);
+// Not anchored to the start of the line — statements that prefix each row
+// with a serial number, reference number, or cheque number (common outside
+// simple passbook exports) would otherwise never match at all.
+const LINE_DATE_RE = new RegExp(`(${DATE_TOKEN})`);
 const TYPE_RE = /\b(debit|credit|dr|cr|withdrawal|deposit)\b/i;
-const AMOUNT_TOKEN_RE = /(?:₹|Rs\.?|INR)?\s*([\d,]+(?:\.\d{1,2})?)/;
-const TRAILING_AMOUNT_RE = /(?:₹|Rs\.?|INR)?\s*([\d,]+\.\d{1,2}|[\d,]+)\s*$/;
+const CURRENCY_PREFIX = "(?:₹|\\$|€|£|Rs\\.?|INR|USD|EUR|GBP)";
+const AMOUNT_TOKEN_RE = new RegExp(`${CURRENCY_PREFIX}?\\s*([\\d,]+(?:\\.\\d{1,2})?)`);
+const AMOUNT_TOKEN_GLOBAL_RE = new RegExp(`${CURRENCY_PREFIX}?\\s*([\\d,]+(?:\\.\\d{1,2})?)`, "g");
+const TRAILING_AMOUNT_RE = new RegExp(`${CURRENCY_PREFIX}?\\s*([\\d,]+\\.\\d{1,2}|[\\d,]+)\\s*$`);
+const TRAILING_AMOUNT_CLUSTER_RE = new RegExp(
+  `((?:${CURRENCY_PREFIX}?\\s*[\\d,]+(?:\\.\\d{1,2})?\\s+){0,3}${CURRENCY_PREFIX}?\\s*[\\d,]+(?:\\.\\d{1,2})?)\\s*$`
+);
 const BALANCE_LINE_RE = /opening balance|closing balance|balance b\/f|balance c\/f/i;
 
 // Many PDF text extractors collapse every row onto one physical line; make
@@ -209,6 +221,14 @@ const BALANCE_LINE_RE = /opening balance|closing balance|balance b\/f|balance c\
 function splitIntoStatementLines(text) {
   const normalized = text.replace(new RegExp(`(${DATE_TOKEN})(?=\\s)`, "g"), "\n$1");
   return normalized.split(/\r?\n/).filter((line) => line.trim().length > 0);
+}
+
+function amountMatches(text) {
+  return [...String(text ?? "").matchAll(AMOUNT_TOKEN_GLOBAL_RE)].map((match) => ({
+    raw: match[1],
+    index: match.index ?? 0,
+    token: match[0],
+  }));
 }
 
 export function parsePdfStatementText(text) {
@@ -223,7 +243,13 @@ export function parsePdfStatementText(text) {
       skippedCount++;
       continue;
     }
-    const [, rawDate, rest] = dateMatch;
+    const rawDate = dateMatch[1];
+    // The date can appear anywhere in the line (e.g. after a serial or
+    // cheque number) — treat everything else on the line, with the date
+    // token removed, as the description-and-amount text to parse further.
+    const rest = (
+      trimmedLine.slice(0, dateMatch.index) + " " + trimmedLine.slice(dateMatch.index + dateMatch[0].length)
+    ).trim();
     const occurredAt = parseDateToIso(rawDate);
     if (!occurredAt) {
       skippedCount++;
@@ -239,15 +265,12 @@ export function parsePdfStatementText(text) {
     const typeMatch = rest.match(TYPE_RE);
     let merchant;
     let rawAmount;
+    let entryType = "debit";
 
     if (typeMatch) {
-      // Statement has an explicit Debit/Credit column. Only debits are
-      // spend — a salary or refund Credit isn't an expense.
-      const isDebit = /^(debit|dr|withdrawal)$/i.test(typeMatch[1]);
-      if (!isDebit) {
-        skippedCount++;
-        continue;
-      }
+      // Statement has an explicit Debit/Credit column. Credits are imported
+      // separately so analytics can show income without counting it as spend.
+      entryType = /^(credit|cr|deposit)$/i.test(typeMatch[1]) ? "credit" : "debit";
       merchant = rest.slice(0, typeMatch.index).trim();
       const afterType = rest.slice(typeMatch.index + typeMatch[0].length).trim();
       const amountMatch = afterType.match(AMOUNT_TOKEN_RE);
@@ -255,12 +278,18 @@ export function parsePdfStatementText(text) {
       // after that (a running balance) is deliberately ignored.
       rawAmount = amountMatch ? amountMatch[1] : null;
     } else {
-      // No explicit type column — fall back to "description ... amount" at
-      // the end of the line (single trailing figure, no running balance).
-      const amountMatch = rest.match(TRAILING_AMOUNT_RE);
-      if (amountMatch) {
-        merchant = rest.slice(0, amountMatch.index).trim();
-        rawAmount = amountMatch[1];
+      // No explicit type column — parse the trailing numeric cluster. If a
+      // statement has "amount balance" at the end, use the first number in
+      // that cluster as the transaction amount and ignore the balance.
+      const clusterMatch = rest.match(TRAILING_AMOUNT_CLUSTER_RE) ?? rest.match(TRAILING_AMOUNT_RE);
+      if (clusterMatch) {
+        const cluster = clusterMatch[1] ?? clusterMatch[0];
+        const amounts = amountMatches(cluster);
+        const firstLooksLikeReference =
+          amounts.length > 1 && !amounts[0].raw.includes(".") && amounts.slice(1).some((amount) => amount.raw.includes("."));
+        const chosen = amounts.length > 1 && !firstLooksLikeReference ? amounts[0] : amounts[amounts.length - 1];
+        merchant = rest.slice(0, clusterMatch.index).trim();
+        rawAmount = chosen?.raw;
       }
     }
 
@@ -269,7 +298,7 @@ export function parsePdfStatementText(text) {
       skippedCount++;
       continue;
     }
-    rows.push({ merchant, amount, entryType: "debit", occurredAt, rawText: trimmedLine });
+    rows.push({ merchant, amount, entryType, occurredAt, rawText: trimmedLine });
   }
 
   if (rows.length === 0) {

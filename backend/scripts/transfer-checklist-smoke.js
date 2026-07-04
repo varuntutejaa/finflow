@@ -7,7 +7,15 @@ import { randomUUID } from "crypto";
 const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "finflow-transfer-check-"));
 process.env.DATA_DIR = tempRoot;
 
-const { createUser, listAccounts, transfer, listTransactions, upsertBudgets, listBudgets } = await import("../src/config/database.js");
+const {
+  createUser,
+  listAccounts,
+  transfer,
+  listTransactions,
+  upsertBudgets,
+  listBudgets,
+  updateTransactionCategory,
+} = await import("../src/config/database.js");
 
 function createDemoUser(label) {
   const token = randomUUID().slice(0, 8);
@@ -143,5 +151,12 @@ assert.ok(shoppingBudget);
 assert.equal(shoppingBudget.spent, 1250);
 assert.equal(shoppingBudget.status, "healthy");
 assert.equal(listBudgets(senderThree.id).length >= 2, true);
+
+const recategorized = updateTransactionCategory(senderThree.id, firstTransfer.transaction.id, "food");
+assert.equal(recategorized.category, "food");
+
+const budgetsAfterEdit = listBudgets(senderThree.id);
+assert.equal(budgetsAfterEdit.find((budget) => budget.category === "shopping").spent, 0);
+assert.equal(budgetsAfterEdit.find((budget) => budget.category === "food").spent, 1250);
 
 console.log("transfer checklist smoke passed");

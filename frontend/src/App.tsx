@@ -7,12 +7,15 @@ import { BudgetPage } from './components/budgets/BudgetPage'
 import { SplitPage } from './components/split/SplitPage'
 import { TransactionsPage } from './components/transactions/TransactionsPage'
 import { AnalyticsPage } from './components/analytics/AnalyticsPage'
+import { InvestmentsPage } from './components/investments/InvestmentsPage'
 import { SettlementPayPopup } from './components/split/SettlementPayPopup'
 import { SetPinModal } from './components/auth/SetPinModal'
 import { PinModal } from './components/shared/PinModal'
 import { TransactionHistory } from './components/transactions/TransactionHistory'
 import { TransferForm } from './components/transfers/TransferForm'
-import { formatMoney, verifyPin, paySettlement } from './api'
+import { QrPayAmountPopup } from './components/transfers/QrPayAmountPopup'
+import { MyQrButton } from './components/shared/MyQrButton'
+import { formatMoney, verifyPin, paySettlement, fetchPinLockoutStatus } from './api'
 import './styles/App.css'
 
 const HIDDEN_BALANCE = '₹ ••••••'
@@ -51,6 +54,14 @@ function isAuthError(err: unknown): boolean {
   return code === 'UNAUTHENTICATED' || code === 'INVALID_TOKEN'
 }
 
+function formatLockCountdown(msRemaining: number): string {
+  const totalSeconds = Math.max(0, Math.ceil(msRemaining / 1000))
+  const hours = Math.floor(totalSeconds / 3600)
+  const minutes = Math.floor((totalSeconds % 3600) / 60)
+  const seconds = totalSeconds % 60
+  return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`
+}
+
 function titleCase(value: string): string {
   return value
     .split(/\s+/)
@@ -66,6 +77,14 @@ function initials(name: string): string {
     .slice(0, 2)
     .map((part) => part[0]?.toUpperCase())
     .join('')
+}
+
+function timeGreeting(name: string): string {
+  const hour = new Date().getHours()
+  const firstName = name.trim().split(/\s+/)[0] || 'there'
+  if (hour < 12) return `Good morning, ${firstName}`
+  if (hour < 17) return `Good afternoon, ${firstName}`
+  return `Good evening, ${firstName}`
 }
 
 function Logo() {
@@ -160,11 +179,21 @@ function App() {
   const [loadError, setLoadError] = useState<string | null>(null)
   const [balancesVisible, setBalancesVisible] = useState(false)
   const [revealingBalances, setRevealingBalances] = useState(false)
-  const [page, setPage] = useState<'dashboard' | 'budgets' | 'split' | 'history' | 'analytics'>('dashboard')
+  const [pinLockedUntil, setPinLockedUntil] = useState<string | null>(null)
+  const [pinLockoutNow, setPinLockoutNow] = useState(() => Date.now())
+  const [page, setPage] = useState<'dashboard' | 'budgets' | 'split' | 'history' | 'analytics' | 'investments'>('dashboard')
   const [budgetAlert, setBudgetAlert] = useState<{ category: string; status: 'warning' | 'exceeded'; utilizationPercent: number } | null>(
     null
   )
   const previousBudgetsRef = useRef<BudgetSummary[]>([])
+  const [autoMandateAlert, setAutoMandateAlert] = useState<{
+    toName: string
+    amount: number
+    category: string
+  } | null>(null)
+  // null until the first successful load — prevents flagging every existing
+  // auto-mandate transaction as "new" the moment the app opens.
+  const seenTransactionIdsRef = useRef<Set<string> | null>(null)
 
   // Set when the user clicks "Pay" on a pending bill-split settlement — drives
   // both the amount-picker popup (shown while confirmedAmount is null) and,
@@ -176,6 +205,15 @@ function App() {
     toUsername: string
     toName: string
     remainingAmount: number
+    confirmedAmount: number | null
+  } | null>(null)
+
+  // Set after scanning another user's account QR code (a link carrying
+  // ?to=username&name=...) — drives the amount-entry popup while
+  // confirmedAmount is null, then the prefilled Pay flow once it's chosen.
+  const [qrPayment, setQrPayment] = useState<{
+    toUsername: string
+    toName: string
     confirmedAmount: number | null
   } | null>(null)
 
@@ -192,6 +230,7 @@ function App() {
     setBudgetAlert(null)
     previousBudgetsRef.current = []
     setSettlementPayment(null)
+    setQrPayment(null)
   }, [])
 
   const budgetingEnabled = user ? budgetingPreferences[user.username] ?? true : true
@@ -218,6 +257,24 @@ function App() {
       ])
       setAccounts(accountsData)
       setTransactions(transactionsData)
+
+      // Detect auto-mandate (recurring) debits that landed since the last
+      // refresh and surface a toast — these happen server-side on a timer,
+      // with no user action to hang a notification off of otherwise.
+      if (seenTransactionIdsRef.current) {
+        const seen = seenTransactionIdsRef.current
+        const newAutoMandate = transactionsData.find(
+          (t) => t.isAutoMandate && t.status === 'completed' && !seen.has(t.id)
+        )
+        if (newAutoMandate) {
+          setAutoMandateAlert({
+            toName: newAutoMandate.toName,
+            amount: newAutoMandate.amount,
+            category: newAutoMandate.category,
+          })
+        }
+      }
+      seenTransactionIdsRef.current = new Set(transactionsData.map((t) => t.id))
 
       // Surface a real-time alert the moment a category newly crosses into
       // "warning" or "exceeded" — passive card colors on the Budget page
@@ -303,11 +360,58 @@ function App() {
     void loadUserData()
   }, [user, refresh])
 
+  // Proactively surfaces a 24h PIN lockout on the dashboard itself, not just
+  // reactively the next time the user happens to enter a PIN somewhere.
+  useEffect(() => {
+    if (!user) return
+    fetchPinLockoutStatus()
+      .then((status) => setPinLockedUntil(status.locked ? status.unlockAt : null))
+      .catch(() => {})
+  }, [user])
+
+  useEffect(() => {
+    if (!pinLockedUntil) return
+    const handle = window.setInterval(() => setPinLockoutNow(Date.now()), 1000)
+    return () => window.clearInterval(handle)
+  }, [pinLockedUntil])
+
+  const pinLockRemainingMs = pinLockedUntil ? new Date(pinLockedUntil).getTime() - pinLockoutNow : 0
+  const isPinLocked = pinLockRemainingMs > 0
+
+  // Picks up a scanned account QR code — the link it encodes carries
+  // ?to=username&name=... — and kicks off the pay-someone flow for it.
+  useEffect(() => {
+    if (!user) return
+    const params = new URLSearchParams(window.location.search)
+    const to = params.get('to')
+    if (!to || to === user.username) return
+    const name = params.get('name') ?? to
+    setQrPayment({ toUsername: to, toName: name, confirmedAmount: null })
+    setPage('dashboard')
+    window.history.replaceState(null, '', window.location.pathname)
+  }, [user])
+
   useEffect(() => {
     if (!budgetAlert) return
     const handle = window.setTimeout(() => setBudgetAlert(null), 7000)
     return () => window.clearTimeout(handle)
   }, [budgetAlert])
+
+  useEffect(() => {
+    if (!autoMandateAlert) return
+    const handle = window.setTimeout(() => setAutoMandateAlert(null), 8000)
+    return () => window.clearTimeout(handle)
+  }, [autoMandateAlert])
+
+  // Recurring debits fire on a server-side timer with no user action to hook
+  // a refresh off of, so poll periodically to notice them and surface a toast.
+  useEffect(() => {
+    if (!user) return
+    const handle = window.setInterval(() => {
+      refresh()
+    }, 20000)
+    return () => window.clearInterval(handle)
+  }, [user, refresh])
 
   const totalBalance = useMemo(() => accounts.reduce((sum, a) => sum + a.balance, 0), [accounts])
 
@@ -364,47 +468,61 @@ function App() {
       <header className="navbar">
         <Logo />
         <div className="navbar-tabs" role="tablist" aria-label="Primary sections">
+          <div className="navbar-tabs-side navbar-tabs-side-left">
+            <button
+              type="button"
+              className={`navbar-tab navbar-tab-budget${page === 'budgets' ? ' navbar-tab-active' : ''}`}
+              onClick={() => setPage('budgets')}
+              aria-pressed={page === 'budgets'}
+            >
+              Budget
+            </button>
+            <button
+              type="button"
+              className={`navbar-tab navbar-tab-split${page === 'split' ? ' navbar-tab-active' : ''}`}
+              onClick={() => setPage('split')}
+              aria-pressed={page === 'split'}
+            >
+              Split
+            </button>
+            <button
+              type="button"
+              className={`navbar-tab navbar-tab-history${page === 'history' ? ' navbar-tab-active' : ''}`}
+              onClick={() => setPage('history')}
+              aria-pressed={page === 'history'}
+            >
+              History
+            </button>
+          </div>
+
           <button
             type="button"
-            className={`navbar-tab navbar-tab-budget${page === 'budgets' ? ' navbar-tab-active' : ''}`}
-            onClick={() => setPage('budgets')}
-            aria-pressed={page === 'budgets'}
-          >
-            Budget
-          </button>
-          <button
-            type="button"
-            className={`navbar-tab navbar-tab-split${page === 'split' ? ' navbar-tab-active' : ''}`}
-            onClick={() => setPage('split')}
-            aria-pressed={page === 'split'}
-          >
-            Split
-          </button>
-          <button
-            type="button"
-            className={`navbar-tab navbar-tab-pay${page === 'dashboard' ? ' navbar-tab-active' : ''}`}
+            className={`navbar-tab-pay-center${page === 'dashboard' ? ' navbar-tab-pay-center-active' : ''}`}
             onClick={() => setPage('dashboard')}
             aria-pressed={page === 'dashboard'}
           >
             <RupeeIcon />
             Pay
           </button>
-          <button
-            type="button"
-            className={`navbar-tab navbar-tab-history${page === 'history' ? ' navbar-tab-active' : ''}`}
-            onClick={() => setPage('history')}
-            aria-pressed={page === 'history'}
-          >
-            History
-          </button>
-          <button
-            type="button"
-            className={`navbar-tab navbar-tab-analytics${page === 'analytics' ? ' navbar-tab-active' : ''}`}
-            onClick={() => setPage('analytics')}
-            aria-pressed={page === 'analytics'}
-          >
-            Analytics
-          </button>
+
+          <div className="navbar-tabs-side navbar-tabs-side-right">
+            <button
+              type="button"
+              className={`navbar-tab navbar-tab-analytics${page === 'analytics' ? ' navbar-tab-active' : ''}`}
+              onClick={() => setPage('analytics')}
+              aria-pressed={page === 'analytics'}
+            >
+              Analytics
+            </button>
+            <button
+              type="button"
+              className={`navbar-tab navbar-tab-investments${page === 'investments' ? ' navbar-tab-active' : ''}`}
+              onClick={() => setPage('investments')}
+              aria-pressed={page === 'investments'}
+            >
+              Investments
+            </button>
+          </div>
         </div>
         <div className="navbar-user">
           <span className="avatar">{initials(user.name)}</span>
@@ -412,6 +530,7 @@ function App() {
             <span className="navbar-user-name">{user.name}</span>
             <span className="navbar-user-handle">@{user.username}</span>
           </div>
+          <MyQrButton username={user.username} name={user.name} />
           <button type="button" className="icon-btn" onClick={logout} title="Log out" aria-label="Log out">
             <svg viewBox="0 0 24 24" fill="none">
               <path
@@ -432,10 +551,27 @@ function App() {
         </div>
       )}
 
+      {isPinLocked && pinLockedUntil && (
+        <div className="pin-lockout-banner" role="alert">
+          <span className="pin-lockout-banner-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none">
+              <rect x="4" y="10" width="16" height="10" rx="2" stroke="currentColor" strokeWidth="1.8" />
+              <path d="M8 10V7a4 4 0 018 0v3" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+            </svg>
+          </span>
+          <span className="pin-lockout-banner-copy">
+            <strong>Payments locked</strong>
+            <span className="muted">Too many incorrect PIN attempts. Try again after {new Date(pinLockedUntil).toLocaleString()}.</span>
+          </span>
+          <span className="pin-lockout-banner-timer">{formatLockCountdown(pinLockRemainingMs)}</span>
+        </div>
+      )}
+
       <main className="app-shell">
         {page === 'dashboard' ? (
           <>
             <section className="hero-stat">
+              <span className="hero-greeting">{timeGreeting(user.name)}</span>
               <div className="hero-stat-top">
                 <span className="hero-stat-label">Total balance</span>
                 <button
@@ -469,12 +605,12 @@ function App() {
               </div>
             </section>
 
-            <div className="app-layout">
+            <div className="app-layout app-layout-stacked">
               <div className="app-col">
                 <TransferForm
                   accounts={accounts}
-                  categories={budgetCategories}
-                  budgetingEnabled={budgetingEnabled}
+                  transactions={transactions}
+                  currentUsername={user.username}
                   onTransferred={refresh}
                   settlementPrefill={
                     settlementPayment && settlementPayment.confirmedAmount !== null
@@ -490,6 +626,20 @@ function App() {
                   }
                   onSettlementPaid={handleSettlementPaid}
                   onCancelSettlement={cancelSettlementPayment}
+                  qrPrefill={
+                    qrPayment && qrPayment.confirmedAmount !== null
+                      ? {
+                          toUsername: qrPayment.toUsername,
+                          toName: qrPayment.toName,
+                          amountPaise: qrPayment.confirmedAmount,
+                        }
+                      : null
+                  }
+                  onQrPaymentDone={() => setQrPayment(null)}
+                  onCancelQrPayment={() => setQrPayment(null)}
+                  onAccountLocked={setPinLockedUntil}
+                  budgetingEnabled={budgetingEnabled}
+                  budgetCategories={budgetCategories}
                 />
               </div>
               <div className="app-col app-col-wide">
@@ -526,6 +676,8 @@ function App() {
             currentUsername={user.username}
             onBack={() => setPage('dashboard')}
           />
+        ) : page === 'investments' ? (
+          <InvestmentsPage onBack={() => setPage('dashboard')} />
         ) : (
           <AnalyticsPage onBack={() => setPage('dashboard')} />
         )}
@@ -538,6 +690,15 @@ function App() {
           remainingAmount={settlementPayment.remainingAmount}
           onConfirm={confirmSettlementAmount}
           onCancel={cancelSettlementPayment}
+        />
+      )}
+
+      {qrPayment && qrPayment.confirmedAmount === null && (
+        <QrPayAmountPopup
+          toName={qrPayment.toName}
+          toUsername={qrPayment.toUsername}
+          onConfirm={(amountPaise) => setQrPayment((current) => (current ? { ...current, confirmedAmount: amountPaise } : current))}
+          onCancel={() => setQrPayment(null)}
         />
       )}
 
@@ -558,6 +719,7 @@ function App() {
             setRevealingBalances(false)
           }}
           onCancel={() => setRevealingBalances(false)}
+          onAccountLocked={setPinLockedUntil}
         />
       )}
 
@@ -579,6 +741,27 @@ function App() {
             type="button"
             className="icon-btn budget-toast-dismiss"
             onClick={() => setBudgetAlert(null)}
+            aria-label="Dismiss"
+          >
+            <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <path d="M6 6l12 12M18 6L6 18" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+            </svg>
+          </button>
+        </div>
+      )}
+
+      {autoMandateAlert && (
+        <div className="auto-mandate-toast" role="status" aria-live="polite">
+          <div className="auto-mandate-toast-copy">
+            <strong>Auto mandate debited</strong>
+            <span>
+              {formatMoney(autoMandateAlert.amount)} sent to {autoMandateAlert.toName} · {titleCase(autoMandateAlert.category)}
+            </span>
+          </div>
+          <button
+            type="button"
+            className="icon-btn budget-toast-dismiss"
+            onClick={() => setAutoMandateAlert(null)}
             aria-label="Dismiss"
           >
             <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">

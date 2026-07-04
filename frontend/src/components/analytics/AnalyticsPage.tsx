@@ -26,18 +26,6 @@ function titleCase(value: string) {
     .join(' ')
 }
 
-function fileToBase64(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader()
-    reader.onload = () => {
-      const result = reader.result as string
-      resolve(result.split(',')[1] ?? '')
-    }
-    reader.onerror = () => reject(reader.error)
-    reader.readAsDataURL(file)
-  })
-}
-
 export function AnalyticsPage({ onBack }: Props) {
   const [analytics, setAnalytics] = useState<SpendingAnalytics | null>(null)
   const [analyticsLoading, setAnalyticsLoading] = useState(true)
@@ -51,6 +39,7 @@ export function AnalyticsPage({ onBack }: Props) {
   const [uploadError, setUploadError] = useState<string | null>(null)
   const [lastBatchId, setLastBatchId] = useState<string | null>(null)
   const [rollingBack, setRollingBack] = useState(false)
+  const [showAdvanced, setShowAdvanced] = useState(false)
 
   const [editingId, setEditingId] = useState<string | null>(null)
   const [editCategory, setEditCategory] = useState('')
@@ -79,10 +68,10 @@ export function AnalyticsPage({ onBack }: Props) {
     setUploading(true)
     setUploadMessage(null)
     setUploadError(null)
-    setLastBatchId(null)
+      setLastBatchId(null)
     try {
       const isPdf = file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf')
-      const result = isPdf ? await importPdfStatement(await fileToBase64(file)) : await importCsvStatement(await file.text())
+      const result = isPdf ? await importPdfStatement(file) : await importCsvStatement(file)
       const notes: string[] = []
       if (result.skippedCount > 0) notes.push(`${result.skippedCount} line${result.skippedCount === 1 ? '' : 's'} skipped`)
       if (result.duplicateCount > 0) notes.push(`${result.duplicateCount} duplicate${result.duplicateCount === 1 ? '' : 's'} ignored`)
@@ -214,6 +203,12 @@ export function AnalyticsPage({ onBack }: Props) {
             </div>
           </div>
 
+          <div className="analytics-detail-toggle">
+            <button type="button" className="secondary-btn" onClick={() => setShowAdvanced((current) => !current)}>
+              {showAdvanced ? 'Hide advanced details' : 'Show advanced details'}
+            </button>
+          </div>
+
           <div className="app-layout">
             <div className="app-col">
               <section className="panel">
@@ -226,19 +221,20 @@ export function AnalyticsPage({ onBack }: Props) {
                 <CategoryBarChart data={analytics.byCategory} />
               </section>
 
-              <section className="panel">
-                <div className="budget-panel-head">
-                  <div>
-                    <span className="transfer-section-kicker">Recurring</span>
-                    <h2>Recurring expenses</h2>
+              {showAdvanced && (
+                <section className="panel">
+                  <div className="budget-panel-head">
+                    <div>
+                      <span className="transfer-section-kicker">Recurring</span>
+                      <h2>Recurring expenses</h2>
+                    </div>
                   </div>
-                </div>
-                {analytics.recurring.length === 0 ? (
-                  <p className="muted tx-empty-state">Nothing recurring detected yet — needs at least 2 payments to the same place.</p>
-                ) : (
-                  <div className="split-settlement-list">
-                    {analytics.recurring.map((r) => (
-                      <div key={r.merchant} className="split-settlement-row">
+                  {analytics.recurring.length === 0 ? (
+                    <p className="muted tx-empty-state">Nothing recurring detected yet — needs at least 2 payments to the same place.</p>
+                  ) : (
+                    <div className="split-settlement-list">
+                      {analytics.recurring.map((r) => (
+                        <div key={r.merchant} className="split-settlement-row">
                         <span>
                           <strong>{r.merchant}</strong> · {r.cadence} · {r.occurrences}x
                           <br />
@@ -247,11 +243,12 @@ export function AnalyticsPage({ onBack }: Props) {
                         <span className="split-expense-split-chip" style={{ background: colorForCategory(r.category) + '22' }}>
                           {titleCase(r.category)}
                         </span>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </section>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </section>
+              )}
             </div>
 
             <div className="app-col app-col-wide">
@@ -265,19 +262,20 @@ export function AnalyticsPage({ onBack }: Props) {
                 <MonthlyTrendChart data={analytics.byMonth} />
               </section>
 
-              <section className="panel">
-                <div className="budget-panel-head">
-                  <div>
-                    <span className="transfer-section-kicker">Top merchants</span>
-                    <h2>Where you spend the most</h2>
+              {showAdvanced && (
+                <section className="panel">
+                  <div className="budget-panel-head">
+                    <div>
+                      <span className="transfer-section-kicker">Top merchants</span>
+                      <h2>Where you spend the most</h2>
+                    </div>
                   </div>
-                </div>
-                {analytics.topMerchants.length === 0 ? (
-                  <p className="muted tx-empty-state">No spending yet.</p>
-                ) : (
-                  <div className="tx-manage-list">
-                    {analytics.topMerchants.map((m, i) => (
-                      <div key={m.merchant} className="tx-manage-row">
+                  {analytics.topMerchants.length === 0 ? (
+                    <p className="muted tx-empty-state">No spending yet.</p>
+                  ) : (
+                    <div className="tx-manage-list">
+                      {analytics.topMerchants.map((m, i) => (
+                        <div key={m.merchant} className="tx-manage-row">
                         <div className="tx-manage-header">
                           <span className="analytics-rank">{i + 1}</span>
                           <div className="tx-manage-main">
@@ -290,16 +288,18 @@ export function AnalyticsPage({ onBack }: Props) {
                         <div className="tx-manage-meta">
                           <span className="tx-amount tx-amount-out">{formatMoney(m.amount)}</span>
                         </div>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </section>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </section>
+              )}
             </div>
           </div>
         </>
       ) : null}
 
+      {showAdvanced && (
       <section className="panel">
         <div className="tx-panel-head">
           <div>
@@ -388,6 +388,7 @@ export function AnalyticsPage({ onBack }: Props) {
           </div>
         )}
       </section>
+      )}
     </section>
   )
 }

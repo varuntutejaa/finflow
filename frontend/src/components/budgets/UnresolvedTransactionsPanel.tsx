@@ -26,7 +26,7 @@ export function UnresolvedTransactionsPanel({ transactions, currentUsername, cat
   const [error, setError] = useState<string | null>(null)
   const noteOptions = useMemo(() => {
     const uniqueCategories = [...new Set(categories)].filter((category) => category !== 'other')
-    return ['Resolve later', ...uniqueCategories]
+    return ['Settle later', ...uniqueCategories]
   }, [categories])
 
   const handleNoteChange = (transactionId: string, note: string) => {
@@ -34,8 +34,8 @@ export function UnresolvedTransactionsPanel({ transactions, currentUsername, cat
   }
 
   const handleSave = async (transactionId: string) => {
-    const selected = selections[transactionId] ?? 'Resolve later'
-    if (selected === 'Resolve later') return
+    const selected = selections[transactionId] ?? 'Settle later'
+    if (selected === 'Settle later') return
 
     setError(null)
     setSavingId(transactionId)
@@ -82,13 +82,13 @@ export function UnresolvedTransactionsPanel({ transactions, currentUsername, cat
               <label className="budget-unresolved-note">
                 <span>Assign category</span>
                 <select
-                  value={selections[tx.id] ?? 'Resolve later'}
+                  value={selections[tx.id] ?? 'Settle later'}
                   onChange={(e) => handleNoteChange(tx.id, e.target.value)}
                   disabled={savingId === tx.id}
                 >
                   {noteOptions.map((note) => (
                     <option key={note} value={note}>
-                      {note === 'Resolve later' ? note : titleCase(note)}
+                      {note === 'Settle later' ? note : titleCase(note)}
                     </option>
                   ))}
                 </select>
@@ -96,7 +96,7 @@ export function UnresolvedTransactionsPanel({ transactions, currentUsername, cat
                   type="button"
                   className="secondary-btn budget-unresolved-save"
                   onClick={() => handleSave(tx.id)}
-                  disabled={savingId === tx.id || (selections[tx.id] ?? 'Resolve later') === 'Resolve later'}
+                  disabled={savingId === tx.id || (selections[tx.id] ?? 'Settle later') === 'Settle later'}
                 >
                   {savingId === tx.id ? 'Saving...' : 'Save'}
                 </button>
