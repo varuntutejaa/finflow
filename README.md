@@ -1,121 +1,160 @@
-# Unlock'D Build-a-thon: Official Master Repository
+# 💸 FinFlow
 
-Welcome to **Unlock'D**, the 24-hour progressive build-a-thon! This repository contains your initial starter code. This guide will walk you through the entire event flow, how to set up your environment, and how to submit your work for judging.
+FinFlow is a full-stack personal finance app — send money, track spending, split bills with friends, manage budgets, and keep an eye on your investments, all in one place.
 
----
-
-## 🎯 The Challenge: A Personal Finance Application
-You will be building a comprehensive **personal finance and expense management application**. 
-
-- **Creative Freedom:** You have full control over the branding, the name of your product, and the UI/UX design. Get creative!
-- **Secret Features:** The specific core features you must implement are currently classified. You will receive your product roadmap progressively, with new features being revealed as you successfully pass each judging gate.
+Built with a **React + TypeScript** frontend and a **Node/Express + SQLite** backend, fully containerized with Docker for a one-command local setup.
 
 ---
 
-## 🏆 1. The Event Workflow
+## ✨ Features
 
-Unlock'D is a unique **24-hour progressive build-a-thon**. You will work in teams, receiving a secret product roadmap and starter code. 
+### 💳 Payments & Accounts
+- User authentication with PIN-protected balance checks
+- Account-to-account money transfers
+- QR code pay — generate your own pay QR or scan someone else's to pay them
 
-- **Progressive Gates:** You must complete timed development sprints.
-- **Deployment & Validation:** After each sprint, you must package your code and clear a "live judging gate" to unlock the next round.
-- **Exclusive Communication:** All updates, guidelines, and announcements will happen exclusively through our **Discord server**. Keep an eye on the announcements channel!
+### 📊 Transactions & Analytics
+- Full transaction history with search, category, date, amount, and transfer-direction filters
+- Downloadable account statements (CSV)
+- Spending analytics with monthly trend charts, category breakdowns, and summary insights
+
+### 📥 Statement Import
+- Import bank statements from **CSV or PDF**
+- Automatic duplicate detection
+- Batch undo for an entire import
+- Per-row review and re-categorization after import
+
+### 💰 Budgets
+- Set category-level budgets and track spend against them
+- Review and resolve uncategorized transactions
+
+### 🤝 Split Expenses
+- Create groups and split expenses with friends
+- Search and add users to a group
+- Track settlements and pay outstanding balances directly
+
+### 🔁 Recurring Payments
+- Schedule recurring transfers to other accounts
+
+### 📈 Investments
+- Track investments by symbol / mutual fund scheme code
+- Live price feed integration
 
 ---
 
-## 💻 2. Tech Stack Freedom & The Backend
+## 🧱 Tech Stack
 
-- **Frontend:** Provided as a React + TypeScript + Vite application.
-- **Backend:** **You have COMPLETE FREEDOM to use any backend language or framework.** Whether you prefer Node.js, Python (FastAPI/Flask), Go, Java, or anything else—it is entirely up to you.
-- **Databases:** You can also add any database you prefer (PostgreSQL, MongoDB, MySQL, etc.) by defining it in the provided `docker-compose.yml`.
+| Layer          | Technology                                                                 |
+|----------------|-----------------------------------------------------------------------------|
+| Frontend       | React 19, TypeScript, Vite                                                  |
+| Backend        | Node.js, Express                                                            |
+| Database       | SQLite (via `better-sqlite3`)                                               |
+| Auth           | JWT (`jsonwebtoken`)                                                        |
+| File Handling  | `multer` (uploads), `pdf-parse` (PDF statements), `exceljs` (spreadsheets)  |
+| QR Codes       | `qrcode` (generate), `jsqr` (scan)                                          |
+| Tooling        | ESLint, TypeScript-ESLint                                                   |
+| Infra          | Docker & Docker Compose                                                     |
 
 ---
 
-## 🐳 3. Mandatory Docker Requirement (Crucial)
+## 🚀 Getting Started
 
-**The Dockerfile Rule:** To ensure our judges can run your application locally without dealing with dependency hell, **your submission MUST be fully Dockerized.** 
+### Option 1: Docker (recommended)
 
-If the judge cannot build and run your containers, your submission will automatically fail the judgement, and you will not **unlock** the next task!
-
-### How the project is currently Dockerized:
-We have provided a boilerplate Docker setup for you:
-1. **Root `docker-compose.yml`**: Orchestrates both the frontend, backend, and any databases you choose to add.
-2. **`frontend/Dockerfile`**: Already configured to serve your Vite React app on port `5173`.
-3. **`backend/Dockerfile`**: A placeholder. **You must update this file** with the instructions for whatever backend language you choose to build with.
-
-### How to Run the Product:
-To spin up the entire application (both frontend and backend), open your terminal in the root directory and run:
+Runs the entire app — frontend, backend, and database — with a single command from the project root:
 
 ```bash
-docker-compose up -d --build
+docker-compose up --build
 ```
-*This command will build the images and run your containers in detached mode. You can view your frontend in your browser at `http://localhost:5173`.*
 
----
+Then open:
+- **Frontend:** http://localhost:5173
+- **Backend API:** http://localhost:3000
 
-## 🚀 4. Integrations, Databases & Bonus Features
+### Option 2: Run locally without Docker
 
-We encourage you to go above and beyond the baseline requirements! As long as you successfully complete the core sprint tasks, you have complete freedom to integrate extra features to "wow" the judges:
+**Backend**
 
-- **Databases:** You can integrate ANY database (PostgreSQL, MySQL, MongoDB, Redis, etc.). 
-- **Advanced Tech:** Feel free to implement WebSockets for real-time updates, Redis for caching, or integrate AI/ML APIs (like OCR for receipt scanning or LLMs for spending insights).
-- **External APIs:** You can connect to third-party services, webhooks, or open APIs.
-
-**Crucial Docker Rule for Integrations:** If your integration requires a local service (like a database or Redis cache), **you must not run it separately**. Instead, add it as an additional service in the provided `docker-compose.yml` file. We have left commented-out examples in the `docker-compose.yml` file to show you exactly how to do this.
-
----
-
-## 🛠️ 5. Installation & Setup (Fork & Clone)
-
-To keep the main repository pristine and track your team's progress securely, we are using a **Fork-and-Pull Request workflow**.
-
-### Step 1: Fork the Repository
-Navigate to the main UnlockD Repository on GitHub and click the **"Fork"** button in the top right corner. This creates a personal copy of the project under your team's/personal GitHub account.
-
-### Step 2: Clone Your Fork
-Open your terminal and clone your newly created fork onto your local machine:
 ```bash
-git clone https://github.com/YOUR_GITHUB_USERNAME/UnlockD-Master-Repo.git
-cd UnlockD-Master-Repo
+cd backend
+npm install
+npm start
 ```
+The API server starts on `http://localhost:3000` (configurable via the `PORT` env var). Data is stored in a local SQLite file; set `DATA_DIR` to control where it's written.
 
-### Step 3: Start the Docker Environment
-Ensure you have **Docker Desktop** installed and running on your machine. Then, execute:
+**Frontend**
+
 ```bash
-docker-compose up -d --build
+cd frontend
+npm install
+npm run dev
+```
+The dev server starts on `http://localhost:5173` and expects the backend at `http://localhost:3000` (configurable via `VITE_API_URL`).
+
+---
+
+## 📁 Project Structure
+
+```
+finflow/
+├── backend/                  # Node/Express API
+│   ├── src/
+│   │   ├── config/           # SQLite schema & data access (database, imports, investments, recurring, splits)
+│   │   ├── routes/           # Express route handlers (auth, accounts, transactions, budgets, groups, imports, investments, recurring, analytics)
+│   │   ├── services/         # Auth/session logic
+│   │   └── server.js         # App entrypoint
+│   └── Dockerfile
+├── frontend/                 # React + TypeScript client
+│   ├── src/
+│   │   ├── api/              # Backend API client
+│   │   ├── components/       # Feature components (accounts, analytics, auth, budgets, investments, split, transactions, transfers, shared)
+│   │   ├── styles/           # Global styles
+│   │   └── utils/            # Shared helpers
+│   └── Dockerfile
+├── docker-compose.yml        # Local multi-service setup
+└── README.md
 ```
 
 ---
 
-## 📤 6. Submission & Judging Process
+## 🔌 Backend API Overview
 
-We are not just judging code; we are judging **functionality**.
+| Route              | Purpose                                      |
+|---------------------|-----------------------------------------------|
+| `/api/auth`         | Sign up, log in, session management           |
+| `/api/accounts`     | Account creation and balances                 |
+| `/api/transactions` | Transaction history, filters, statements      |
+| `/api/imports`      | CSV/PDF statement import & batch management   |
+| `/api/budgets`      | Category budgets                              |
+| `/api/groups`       | Split-expense groups and settlements          |
+| `/api/recurring`    | Recurring payment schedules                   |
+| `/api/investments`  | Investment tracking and price feeds           |
+| `/api/analytics`    | Spending trends and summary insights          |
 
-### The PR Submission Workflow:
-When you finish a sprint, you must submit a Pull Request (PR) to the main UnlockD repository.
+All routes (aside from auth) require a valid JWT, issued at login.
 
-1. **Create a Feature Branch:** Never work directly on `main`. Always branch off for a sprint.
-   ```bash
-   git checkout -b feature/your-sprint-name
-   ```
-2. **Commit your work:**
-   ```bash
-   git add .
-   git commit -m "feat: completed sprint 1"
-   ```
-3. **Push to your Fork:**
-   ```bash
-   git push origin feature/your-sprint-name
-   ```
-4. **Open a PR:** Go to the main project repository on GitHub and open a Pull Request comparing your feature branch against the main repo.
+---
 
-### The PR Template
-You **must** fill out the provided PR template when submitting (Team Name, Features Added, Known Bugs). Incomplete PRs will not be judged.
+## ⚙️ Environment Variables
 
-### Local Judging Process
-- **No Cloud Deployment Required:** You are not required to host your app on AWS, Heroku, or Vercel. 
-- Our judges will pull your PR locally, run `docker-compose up --build`, and test your application directly on their machines.
-- **Standardized Ports:** Ensure your application is configured to expose its web server on the ports specified in your configuration. If you change ports, document it in your PR or README!
+| Variable      | Used by  | Description                                  | Default                     |
+|---------------|----------|-----------------------------------------------|------------------------------|
+| `PORT`        | backend  | Port the API server listens on                | `3000`                       |
+| `DATA_DIR`    | backend  | Directory for the SQLite data file            | project-local                |
+| `JWT_SECRET`  | backend  | Secret used to sign auth tokens               | *(set in docker-compose)*    |
+| `VITE_API_URL`| frontend | Base URL the frontend uses to call the API    | `http://localhost:3000`      |
 
-> **Brutally Honest Reminder:** If your submission does not follow these technical guidelines, it will fail the automated "gate check," and your team will not unlock the next task. If you experience technical setup issues, reach out to the organizers on Discord immediately!
+---
 
-Good luck, and Happy Building!
+## 🧪 Linting
+
+```bash
+cd frontend
+npm run lint
+```
+
+---
+
+## 📄 License
+
+This project currently has no license file — all rights reserved by the author unless otherwise stated.
