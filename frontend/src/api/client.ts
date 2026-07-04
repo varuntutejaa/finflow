@@ -40,6 +40,7 @@ export interface Transaction {
   status: 'completed' | 'failed'
   failureReason: string | null
   isAutoMandate: boolean
+  isQrPayment: boolean
   createdAt: string
 }
 
@@ -54,6 +55,8 @@ export interface TransactionFilters {
   direction?: 'sent' | 'received'
   status?: 'completed' | 'failed'
   referenceId?: string
+  limit?: number
+  offset?: number
 }
 
 export interface BudgetSummary {
@@ -287,6 +290,35 @@ export function fetchTransactions(filters: TransactionFilters = {}): Promise<Tra
   return request(`/api/transactions${qs ? `?${qs}` : ''}`)
 }
 
+// Like fetchTransactions, but for the History page's paged view: passing
+// `limit` opts the backend into LIMIT/OFFSET + an X-Total-Count header
+// instead of returning the whole matching set, so browsing a large ledger
+// doesn't ship (or render) every row at once. Bypasses the shared `request`
+// helper since that only returns the parsed body, not response headers.
+export async function fetchTransactionsPage(
+  filters: TransactionFilters = {}
+): Promise<{ transactions: Transaction[]; total: number }> {
+  const params = new URLSearchParams()
+  for (const [key, value] of Object.entries(filters)) {
+    if (value !== undefined && value !== '') params.set(key, String(value))
+  }
+  const qs = params.toString()
+  const token = getToken()
+  const res = await fetch(`${BASE_URL}/api/transactions${qs ? `?${qs}` : ''}`, {
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+  })
+  const body = await res.json()
+  if (!res.ok) {
+    const error: ApiError = body.error ?? { code: 'UNKNOWN', message: 'Request failed' }
+    const err = new Error(error.message) as Error & { code: string }
+    err.code = error.code
+    throw err
+  }
+  const totalHeader = res.headers.get('X-Total-Count')
+  const total = totalHeader !== null ? Number(totalHeader) : body.length
+  return { transactions: body as Transaction[], total }
+}
+
 export function downloadTransactionsCsv(filters: TransactionFilters = {}): Promise<void> {
   const params = new URLSearchParams()
   for (const [key, value] of Object.entries(filters)) {
@@ -358,6 +390,7 @@ export function transfer(input: {
   pin: string
   category: string
   note?: string
+  isQrPayment?: boolean
 }): Promise<{ transaction: Transaction; replayed: boolean; accounts: Account[] }> {
   return request('/api/transactions/transfer', {
     method: 'POST',
@@ -534,7 +567,7 @@ export function fetchSpendingAnalytics(filters: { dateFrom?: string; dateTo?: st
   return request(`/api/analytics/spending${qs ? `?${qs}` : ''}`)
 }
 
-export type RecurringFrequency = 'daily' | 'weekly' | 'monthly'
+export type RecurringFrequency = 'once' | 'daily' | 'weekly' | 'monthly'
 
 export interface RecurringPayment {
   id: string
@@ -568,7 +601,7 @@ export function createRecurringPayment(input: {
   return request('/api/recurring', { method: 'POST', body: JSON.stringify(input) })
 }
 
-export function cancelRecurringPayment(id: string): Promise<{ success: true }> {
+export function cancelRecurringPayment(id: string): Promise<{ success: true; action: 'cancelled' | 'deleted' }> {
   return request(`/api/recurring/${id}`, { method: 'DELETE' })
 }
 

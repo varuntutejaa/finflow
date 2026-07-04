@@ -1,16 +1,35 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: finflow
+      POSTGRES_PASSWORD: finflow-local-compose-secret
+      POSTGRES_DB: finflow
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U finflow -d finflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
   backend:
     build:
       context: ./backend
       dockerfile: Dockerfile
     environment:
-      DATA_DIR: /app/data
-      JWT_SECRET: finflow-local-compose-secret
+      DATABASE_URL: postgres://finflow:finflow-local-compose-secret@postgres:5432/finflow
+      JWT_SECRET: finflow-local-compose-secret-change-me-32
+      CORS_ORIGIN: http://localhost:5173
       PORT: 3000
     ports:
       - "3000:3000"
-    volumes:
-      - backend_data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
 
   frontend:
@@ -27,4 +46,4 @@ services:
     restart: unless-stopped
 
 volumes:
-  backend_data:
+  postgres_data:

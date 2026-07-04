@@ -76,6 +76,12 @@ export function UnresolvedTransactionsPanel({ transactions, currentUsername, cat
                 </strong>
                 <span>{new Date(tx.createdAt).toLocaleString()}</span>
                 <span>{formatMoney(tx.amount)}</span>
+                {(tx.isAutoMandate || tx.isQrPayment) && (
+                  <span className="tx-meta">
+                    {tx.isAutoMandate && <span className="tx-automandate-tag">Auto mandate</span>}
+                    {tx.isQrPayment && <span className="tx-qr-tag">QR</span>}
+                  </span>
+                )}
                 {tx.note && <span className="budget-unresolved-note-text">Note: {tx.note}</span>}
               </div>
 

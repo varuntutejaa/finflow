@@ -2,7 +2,7 @@
 
 FinFlow is a full-stack personal finance app — send money, track spending, split bills with friends, manage budgets, and keep an eye on your investments, all in one place.
 
-Built with a **React + TypeScript** frontend and a **Node/Express + SQLite** backend, fully containerized with Docker for a one-command local setup.
+Built with a **React + TypeScript** frontend and a **Node/Express + PostgreSQL** backend, fully containerized with Docker for a one-command local setup.
 
 ---
 
@@ -48,7 +48,7 @@ Built with a **React + TypeScript** frontend and a **Node/Express + SQLite** bac
 |----------------|-----------------------------------------------------------------------------|
 | Frontend       | React 19, TypeScript, Vite                                                  |
 | Backend        | Node.js, Express                                                            |
-| Database       | SQLite (via `better-sqlite3`)                                               |
+| Database       | PostgreSQL (`pg`)                                                           |
 | Auth           | JWT (`jsonwebtoken`)                                                        |
 | File Handling  | `multer` (uploads), `pdf-parse` (PDF statements), `exceljs` (spreadsheets)  |
 | QR Codes       | `qrcode` (generate), `jsqr` (scan)                                          |
@@ -78,9 +78,19 @@ Then open:
 ```bash
 cd backend
 npm install
-npm start
+npm run db:local
 ```
-The API server starts on `http://localhost:3000` (configurable via the `PORT` env var). Data is stored in a local SQLite file; set `DATA_DIR` to control where it's written.
+
+In another terminal:
+
+```bash
+cd backend
+DATABASE_URL=postgres://finflow:finflow@localhost:54329/finflow npm start
+```
+
+The API server starts on `http://localhost:3000` (configurable via the `PORT` env var). For local development without Docker, `npm run db:local` runs an embedded PostgreSQL instance with persistent data in `~/.finflow-postgres-data`.
+
+If you already run PostgreSQL yourself, skip `npm run db:local` and set `DATABASE_URL` to your own database.
 
 **Frontend**
 
@@ -99,7 +109,7 @@ The dev server starts on `http://localhost:5173` and expects the backend at `htt
 finflow/
 ├── backend/                  # Node/Express API
 │   ├── src/
-│   │   ├── config/           # SQLite schema & data access (database, imports, investments, recurring, splits)
+│   │   ├── config/           # PostgreSQL schema & data access (database, imports, investments, recurring, splits)
 │   │   ├── routes/           # Express route handlers (auth, accounts, transactions, budgets, groups, imports, investments, recurring, analytics)
 │   │   ├── services/         # Auth/session logic
 │   │   └── server.js         # App entrypoint
@@ -137,12 +147,13 @@ All routes (aside from auth) require a valid JWT, issued at login.
 
 ## ⚙️ Environment Variables
 
-| Variable      | Used by  | Description                                  | Default                     |
-|---------------|----------|-----------------------------------------------|------------------------------|
-| `PORT`        | backend  | Port the API server listens on                | `3000`                       |
-| `DATA_DIR`    | backend  | Directory for the SQLite data file            | project-local                |
-| `JWT_SECRET`  | backend  | Secret used to sign auth tokens               | *(set in docker-compose)*    |
-| `VITE_API_URL`| frontend | Base URL the frontend uses to call the API    | `http://localhost:3000`      |
+| Variable       | Used by  | Description                                                   | Default                     |
+|----------------|----------|---------------------------------------------------------------|-----------------------------|
+| `PORT`         | backend  | Port the API server listens on                                | `3000`                      |
+| `DATABASE_URL` | backend  | PostgreSQL connection string; required in production          | local dev Postgres URL      |
+| `JWT_SECRET`   | backend  | Secret used to sign auth tokens; 32+ chars in production      | dev-only fallback           |
+| `CORS_ORIGIN`  | backend  | Comma-separated frontend origins allowed to call the API      | `http://localhost:5173`     |
+| `VITE_API_URL` | frontend | Base URL the frontend uses to call the API                    | `http://localhost:3000`     |
 
 ---
 

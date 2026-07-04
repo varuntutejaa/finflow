@@ -1,7 +1,8 @@
 import { randomUUID } from "crypto";
-import db, { transfer, getAccount, findUserByUsername, normalizeBudgetCategory, TransferError } from "./database.js";
+import { pool, dbGet, dbAll, dbRun } from "./db.js";
+import { transfer, getAccount, findUserByUsername, normalizeBudgetCategory, TransferError } from "./database.js";
 
-db.exec(`
+await pool.query(`
   CREATE TABLE IF NOT EXISTS recurring_payments (
     id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL REFERENCES users(id),
@@ -9,12 +10,12 @@ db.exec(`
     to_username TEXT NOT NULL,
     category TEXT NOT NULL DEFAULT 'other',
     amount INTEGER NOT NULL CHECK (amount > 0),
-    frequency TEXT NOT NULL CHECK (frequency IN ('daily', 'weekly', 'monthly')),
+    frequency TEXT NOT NULL CHECK (frequency IN ('once', 'daily', 'weekly', 'monthly')),
     next_run_at TEXT NOT NULL,
     last_run_at TEXT,
     last_status TEXT,
     active INTEGER NOT NULL DEFAULT 1,
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    created_at TEXT NOT NULL DEFAULT iso_now()
   );
 
   CREATE INDEX IF NOT EXISTS idx_recurring_user ON recurring_payments(user_id);
@@ -29,7 +30,9 @@ export class RecurringPaymentError extends Error {
   }
 }
 
-const FREQUENCIES = ["daily", "weekly", "monthly"];
+// "once" is a single scheduled transfer for a future date/time (schedule
+// ahead, no repeat); the rest repeat on a fixed cadence until cancelled.
+const FREQUENCIES = ["once", "daily", "weekly", "monthly"];
 
 function advanceDate(iso, frequency) {
   const date = new Date(iso);
@@ -65,35 +68,43 @@ const RECURRING_SELECT = `
   LEFT JOIN users u ON u.username = r.to_username
 `;
 
-const insertRecurringStmt = db.prepare(`
+const INSERT_RECURRING_SQL = `
   INSERT INTO recurring_payments (id, user_id, from_account_id, to_username, category, amount, frequency, next_run_at)
   VALUES (@id, @userId, @fromAccountId, @toUsername, @category, @amount, @frequency, @nextRunAt)
-`);
-const listRecurringStmt = db.prepare(`${RECURRING_SELECT} WHERE r.user_id = ? ORDER BY r.next_run_at ASC`);
-const cancelRecurringStmt = db.prepare("UPDATE recurring_payments SET active = 0 WHERE id = @id AND user_id = @userId");
-const listDueStmt = db.prepare("SELECT * FROM recurring_payments WHERE active = 1 AND next_run_at <= ?");
-const advanceRecurringStmt = db.prepare(`
+`;
+const LIST_RECURRING_SQL = `${RECURRING_SELECT} WHERE r.user_id = ? ORDER BY r.next_run_at ASC`;
+const GET_RECURRING_OWNER_SQL = "SELECT active FROM recurring_payments WHERE id = ? AND user_id = ?";
+const CANCEL_RECURRING_SQL = "UPDATE recurring_payments SET active = 0 WHERE id = @id AND user_id = @userId AND active = 1";
+const DELETE_CANCELLED_RECURRING_SQL = "DELETE FROM recurring_payments WHERE id = @id AND user_id = @userId AND active = 0";
+const LIST_DUE_SQL = "SELECT * FROM recurring_payments WHERE active = 1 AND next_run_at <= ?";
+const ADVANCE_RECURRING_SQL = `
   UPDATE recurring_payments
-  SET next_run_at = @nextRunAt, last_run_at = @lastRunAt, last_status = @lastStatus
+  SET next_run_at = @nextRunAt, last_run_at = @lastRunAt, last_status = @lastStatus, active = @active
   WHERE id = @id
-`);
+`;
 
-export function createRecurringPayment({ userId, fromAccountId, toUsername, amount, category, frequency, startAt }) {
+export async function createRecurringPayment({ userId, fromAccountId, toUsername, amount, category, frequency, startAt }) {
   if (!Number.isSafeInteger(amount) || amount <= 0) {
     throw new RecurringPaymentError(400, "INVALID_AMOUNT", "amount must be a positive integer (cents)");
   }
   if (!FREQUENCIES.includes(frequency)) {
-    throw new RecurringPaymentError(400, "INVALID_FREQUENCY", "frequency must be daily, weekly, or monthly");
+    throw new RecurringPaymentError(400, "INVALID_FREQUENCY", "frequency must be once, daily, weekly, or monthly");
+  }
+  if (frequency === "once") {
+    const parsed = startAt ? new Date(startAt) : null;
+    if (!parsed || Number.isNaN(parsed.getTime()) || parsed.getTime() <= Date.now()) {
+      throw new RecurringPaymentError(400, "INVALID_START_AT", "startAt must be a future date for a one-time schedule");
+    }
   }
   if (typeof toUsername !== "string" || toUsername.trim().length === 0) {
     throw new RecurringPaymentError(400, "INVALID_ACCOUNT", "toUsername is required");
   }
-  const account = getAccount(fromAccountId, userId);
+  const account = await getAccount(fromAccountId, userId);
   if (!account) {
     throw new RecurringPaymentError(404, "ACCOUNT_NOT_FOUND", `Account ${fromAccountId} not found`);
   }
   const normalizedToUsername = toUsername.trim().toLowerCase();
-  const recipient = findUserByUsername(normalizedToUsername);
+  const recipient = await findUserByUsername(normalizedToUsername);
   if (!recipient) {
     throw new RecurringPaymentError(404, "RECIPIENT_NOT_FOUND", `${toUsername} was not found`);
   }
@@ -103,7 +114,7 @@ export function createRecurringPayment({ userId, fromAccountId, toUsername, amou
 
   const nextRunAt = startAt ? new Date(startAt).toISOString() : new Date().toISOString();
   const id = randomUUID();
-  insertRecurringStmt.run({
+  await dbRun(INSERT_RECURRING_SQL, {
     id,
     userId,
     fromAccountId,
@@ -116,18 +127,27 @@ export function createRecurringPayment({ userId, fromAccountId, toUsername, amou
   return findOneJSON(id);
 }
 
-function findOneJSON(id) {
-  const row = db.prepare(`${RECURRING_SELECT} WHERE r.id = ?`).get(id);
+async function findOneJSON(id) {
+  const row = await dbGet(`${RECURRING_SELECT} WHERE r.id = ?`, id);
   return toRecurringJSON(row);
 }
 
-export function listRecurringPayments(userId) {
-  return listRecurringStmt.all(userId).map(toRecurringJSON);
+export async function listRecurringPayments(userId) {
+  const rows = await dbAll(LIST_RECURRING_SQL, userId);
+  return rows.map(toRecurringJSON);
 }
 
-export function cancelRecurringPayment(userId, id) {
-  const result = cancelRecurringStmt.run({ id, userId });
-  return result.changes > 0;
+export async function cancelRecurringPayment(userId, id) {
+  const existing = await dbGet(GET_RECURRING_OWNER_SQL, id, userId);
+  if (!existing) return null;
+
+  if (Boolean(existing.active)) {
+    const result = await dbRun(CANCEL_RECURRING_SQL, { id, userId });
+    return result.changes > 0 ? { action: "cancelled" } : null;
+  }
+
+  const result = await dbRun(DELETE_CANCELLED_RECURRING_SQL, { id, userId });
+  return result.changes > 0 ? { action: "deleted" } : null;
 }
 
 // Runs every tick of the in-process scheduler (see server.js) — picks up
@@ -136,13 +156,13 @@ export function cancelRecurringPayment(userId, id) {
 // recurring payments respect the exact same balance/account rules. No PIN
 // is re-entered here: the mandate was authorized with the PIN once, at
 // creation time, same as a real standing instruction.
-export function runDueRecurringPayments(now = new Date().toISOString()) {
-  const due = listDueStmt.all(now);
+export async function runDueRecurringPayments(now = new Date().toISOString()) {
+  const due = await dbAll(LIST_DUE_SQL, now);
   const results = [];
   for (const row of due) {
     let status = "completed";
     try {
-      const { transaction } = transfer({
+      const { transaction } = await transfer({
         userId: row.user_id,
         fromAccountId: row.from_account_id,
         toUsername: row.to_username,
@@ -150,17 +170,23 @@ export function runDueRecurringPayments(now = new Date().toISOString()) {
         category: row.category,
         idempotencyKey: `recurring:${row.id}:${row.next_run_at}`,
         isAutoMandate: true,
+        // Lets the frontend's auto-mandate toast tell a one-off scheduled
+        // payment apart from a repeating one, without a separate column.
+        note: row.frequency === "once" ? "Scheduled payment" : "Recurring payment",
       });
       if (transaction.status === "failed") status = "failed";
     } catch (err) {
       if (!(err instanceof TransferError)) throw err;
       status = "failed";
     }
-    advanceRecurringStmt.run({
+    // A "once" mandate never repeats — deactivate it right after its single
+    // run instead of computing a next occurrence.
+    await dbRun(ADVANCE_RECURRING_SQL, {
       id: row.id,
-      nextRunAt: advanceDate(row.next_run_at, row.frequency),
+      nextRunAt: row.frequency === "once" ? row.next_run_at : advanceDate(row.next_run_at, row.frequency),
       lastRunAt: now,
       lastStatus: status,
+      active: row.frequency === "once" ? 0 : 1,
     });
     results.push({ id: row.id, status });
   }

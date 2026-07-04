@@ -53,7 +53,7 @@ export function GroupList({ groups, loading, onOpenGroup, onCreateGroup }: Props
 
   return (
     <>
-      <section className="panel">
+      <section className="panel split-create-panel">
         <div className="budget-panel-head">
           <div>
             <span className="transfer-section-kicker">New group</span>
@@ -95,7 +95,7 @@ export function GroupList({ groups, loading, onOpenGroup, onCreateGroup }: Props
         {error && <p className="form-error">{error}</p>}
       </section>
 
-      <section className="panel">
+      <section className="panel split-groups-panel">
         <div className="budget-panel-head">
           <div>
             <span className="transfer-section-kicker">Your groups</span>

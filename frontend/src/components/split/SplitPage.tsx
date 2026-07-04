@@ -75,7 +75,7 @@ export function SplitPage({ currentUsername, onBack, onPaySettlement }: Props) {
   }
 
   return (
-    <section className="budget-page">
+    <section className="budget-page split-page">
       <div className="budget-page-head">
         <div>
           <span className="transfer-section-kicker">Bill splitting</span>

@@ -1,7 +1,8 @@
 import { randomUUID } from "crypto";
-import db, { normalizeBudgetCategory, listTransactions } from "./database.js";
+import { pool, dbGet, dbAll, dbRun, withTransaction } from "./db.js";
+import { normalizeBudgetCategory, listTransactions } from "./database.js";
 
-db.exec(`
+await pool.query(`
   CREATE TABLE IF NOT EXISTS imported_transactions (
     id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL REFERENCES users(id),
@@ -12,23 +13,14 @@ db.exec(`
     category TEXT NOT NULL DEFAULT 'other',
     occurred_at TEXT NOT NULL,
     raw_text TEXT,
-    imported_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    imported_at TEXT NOT NULL DEFAULT iso_now(),
+    batch_id TEXT
   );
 
   CREATE INDEX IF NOT EXISTS idx_imported_tx_user ON imported_transactions(user_id);
   CREATE INDEX IF NOT EXISTS idx_imported_tx_occurred ON imported_transactions(occurred_at);
+  CREATE INDEX IF NOT EXISTS idx_imported_tx_batch ON imported_transactions(batch_id);
 `);
-
-// Every row inserted by one CSV/PDF upload shares a batch_id, so the whole
-// upload can be undone in one shot instead of deleting rows one at a time.
-const importedColumns = db.prepare("PRAGMA table_info(imported_transactions)").all().map((c) => c.name);
-if (!importedColumns.includes("batch_id")) {
-  db.exec("ALTER TABLE imported_transactions ADD COLUMN batch_id TEXT");
-  db.exec("CREATE INDEX IF NOT EXISTS idx_imported_tx_batch ON imported_transactions(batch_id)");
-}
-if (!importedColumns.includes("entry_type")) {
-  db.exec("ALTER TABLE imported_transactions ADD COLUMN entry_type TEXT NOT NULL DEFAULT 'debit'");
-}
 
 class ImportError extends Error {
   constructor(status, code, message) {
@@ -314,31 +306,33 @@ export function parsePdfStatementText(text) {
 
 // ---- persistence ----
 
-const insertImportedTxStmt = db.prepare(`
+const INSERT_IMPORTED_TX_SQL = `
   INSERT INTO imported_transactions (id, user_id, source, merchant, amount, entry_type, category, occurred_at, raw_text, batch_id)
   VALUES (@id, @userId, @source, @merchant, @amount, @entryType, @category, @occurredAt, @rawText, @batchId)
-`);
+`;
 
-const insertManyTxn = db.transaction((userId, source, rows, batchId) => {
-  const inserted = [];
-  for (const row of rows) {
-    const id = randomUUID();
-    insertImportedTxStmt.run({
-      id,
-      userId,
-      source,
-      merchant: row.merchant,
-      amount: row.amount,
-      entryType: row.entryType ?? "debit",
-      category: row.category ?? suggestCategory(row.merchant),
-      occurredAt: row.occurredAt,
-      rawText: row.rawText ?? null,
-      batchId,
-    });
-    inserted.push(id);
-  }
-  return inserted;
-});
+async function insertMany(userId, source, rows, batchId) {
+  return withTransaction(async (tx) => {
+    const inserted = [];
+    for (const row of rows) {
+      const id = randomUUID();
+      await tx.run(INSERT_IMPORTED_TX_SQL, {
+        id,
+        userId,
+        source,
+        merchant: row.merchant,
+        amount: row.amount,
+        entryType: row.entryType ?? "debit",
+        category: row.category ?? suggestCategory(row.merchant),
+        occurredAt: row.occurredAt,
+        rawText: row.rawText ?? null,
+        batchId,
+      });
+      inserted.push(id);
+    }
+    return inserted;
+  });
+}
 
 function toImportedJSON(row) {
   return {
@@ -364,12 +358,15 @@ function duplicateKey(row) {
   return `${normalizeMerchantKey(row.merchant)}|${row.amount}|${row.entryType ?? "debit"}|${row.occurredAt}|${(row.rawText ?? "").trim()}`;
 }
 
-export function importTransactions(userId, source, rows) {
+export async function importTransactions(userId, source, rows) {
   if (rows.length === 0) {
     throw new ImportError(400, "NO_ROWS", "No valid transaction rows were found to import");
   }
 
-  const existingRows = db.prepare("SELECT merchant, amount, entry_type, occurred_at, raw_text FROM imported_transactions WHERE user_id = ?").all(userId);
+  const existingRows = await dbAll(
+    "SELECT merchant, amount, entry_type, occurred_at, raw_text FROM imported_transactions WHERE user_id = ?",
+    userId
+  );
   const seenKeys = new Set(
     existingRows.map((r) =>
       duplicateKey({ merchant: r.merchant, amount: r.amount, entryType: r.entry_type, occurredAt: r.occurred_at, rawText: r.raw_text })
@@ -397,23 +394,21 @@ export function importTransactions(userId, source, rows) {
   }
 
   const batchId = randomUUID();
-  const ids = insertManyTxn(userId, source, uniqueRows, batchId);
-  const placeholders = ids.map(() => "?").join(",");
-  const inserted = db
-    .prepare(`SELECT * FROM imported_transactions WHERE id IN (${placeholders})`)
-    .all(...ids)
-    .map(toImportedJSON);
+  const ids = await insertMany(userId, source, uniqueRows, batchId);
+  const inserted = (await dbAll(`SELECT * FROM imported_transactions WHERE id IN (${ids.map(() => "?").join(",")})`, ...ids)).map(
+    toImportedJSON
+  );
   inserted.sort((a, b) => (a.occurredAt < b.occurredAt ? 1 : -1));
   return { batchId, imported: inserted, duplicateCount };
 }
 
 // Undoes one whole upload — every row inserted with the same batch_id.
-export function deleteImportBatch(userId, batchId) {
-  const result = db.prepare("DELETE FROM imported_transactions WHERE user_id = ? AND batch_id = ?").run(userId, batchId);
+export async function deleteImportBatch(userId, batchId) {
+  const result = await dbRun("DELETE FROM imported_transactions WHERE user_id = ? AND batch_id = ?", userId, batchId);
   return result.changes;
 }
 
-export function listImportedTransactions(userId, { category, dateFrom, dateTo } = {}) {
+export async function listImportedTransactions(userId, { category, dateFrom, dateTo } = {}) {
   const clauses = ["user_id = @userId"];
   const params = { userId };
   if (typeof category === "string" && category.trim()) {
@@ -428,24 +423,20 @@ export function listImportedTransactions(userId, { category, dateFrom, dateTo } 
     clauses.push("occurred_at <= @dateTo");
     params.dateTo = dateTo;
   }
-  return db
-    .prepare(`SELECT * FROM imported_transactions WHERE ${clauses.join(" AND ")} ORDER BY occurred_at DESC`)
-    .all(params)
-    .map(toImportedJSON);
+  const rows = await dbAll(`SELECT * FROM imported_transactions WHERE ${clauses.join(" AND ")} ORDER BY occurred_at DESC`, params);
+  return rows.map(toImportedJSON);
 }
 
-const updateImportedCategoryStmt = db.prepare(
-  "UPDATE imported_transactions SET category = @category WHERE id = @id AND user_id = @userId"
-);
+const UPDATE_IMPORTED_CATEGORY_SQL = "UPDATE imported_transactions SET category = @category WHERE id = @id AND user_id = @userId";
 
-export function updateImportedTransactionCategory(userId, id, category) {
-  const result = updateImportedCategoryStmt.run({ id, userId, category: normalizeBudgetCategory(category) });
+export async function updateImportedTransactionCategory(userId, id, category) {
+  const result = await dbRun(UPDATE_IMPORTED_CATEGORY_SQL, { id, userId, category: normalizeBudgetCategory(category) });
   if (result.changes === 0) return null;
-  return toImportedJSON(db.prepare("SELECT * FROM imported_transactions WHERE id = ?").get(id));
+  return toImportedJSON(await dbGet("SELECT * FROM imported_transactions WHERE id = ?", id));
 }
 
-export function deleteImportedTransaction(userId, id) {
-  const result = db.prepare("DELETE FROM imported_transactions WHERE id = ? AND user_id = ?").run(id, userId);
+export async function deleteImportedTransaction(userId, id) {
+  const result = await dbRun("DELETE FROM imported_transactions WHERE id = ? AND user_id = ?", id, userId);
   return result.changes > 0;
 }
 
@@ -459,11 +450,11 @@ function normalizeMerchantKey(name) {
   return name.trim().toLowerCase().replace(/\s+/g, " ");
 }
 
-export function computeSpendingAnalytics(userId, { dateFrom, dateTo } = {}) {
-  const realTransactions = listTransactions({ userId, dateFrom, dateTo, direction: "sent", status: "completed" }).filter(
+export async function computeSpendingAnalytics(userId, { dateFrom, dateTo } = {}) {
+  const realTransactions = (await listTransactions({ userId, dateFrom, dateTo, direction: "sent", status: "completed" })).filter(
     (t) => t.category !== "transfer" // exclude money moved between your own accounts
   );
-  const imported = listImportedTransactions(userId, { dateFrom, dateTo });
+  const imported = await listImportedTransactions(userId, { dateFrom, dateTo });
   const importedDebits = imported.filter((t) => (t.entryType ?? "debit") === "debit");
   const importedCredits = imported.filter((t) => t.entryType === "credit");
 

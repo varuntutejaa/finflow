@@ -879,6 +879,7 @@
   background: linear-gradient(135deg, var(--accent), color-mix(in srgb, var(--accent-2) 72%, var(--accent)));
   color: #fff;
   box-shadow: 0 8px 20px color-mix(in srgb, var(--accent) 35%, transparent);
+  transition: transform 0.15s ease, box-shadow 0.15s ease, filter 0.15s ease;
 
   @media (max-width: 480px) {
     padding: 8px 18px;
@@ -890,11 +891,30 @@
   width: 17px;
   height: 17px;
   flex-shrink: 0;
+  transition: transform 0.15s ease;
 }
 
 .navbar-tab-pay-center:hover {
   color: #fff;
-  filter: brightness(1.05);
+  filter: brightness(1.08);
+  transform: translateY(-2px);
+  box-shadow: 0 12px 26px color-mix(in srgb, var(--accent) 42%, transparent);
+}
+
+.navbar-tab-pay-center:hover svg {
+  transform: scale(1.1) rotate(-8deg);
+}
+
+.navbar-tab-pay-center:active {
+  transform: translateY(0) scale(0.96);
+  filter: brightness(0.97);
+  box-shadow: 0 4px 12px color-mix(in srgb, var(--accent) 35%, transparent);
+  transition: transform 0.05s ease, box-shadow 0.05s ease, filter 0.05s ease;
+}
+
+.navbar-tab-pay-center:focus-visible {
+  outline: 2px solid #fff;
+  outline-offset: 2px;
 }
 
 .navbar-tab-pay-center-active {
@@ -1478,7 +1498,7 @@
 
 .transfer-card-grid-single {
   grid-template-columns: 1fr;
-  max-width: 460px;
+  max-width: 560px;
 }
 
 .transfer-card-main {
@@ -1524,16 +1544,20 @@
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  max-width: 100%;
   padding: 5px;
   border-radius: 999px;
   background: var(--bg);
   border: 1px solid var(--border);
   margin-bottom: 18px;
+  overflow-x: auto;
 }
 
 .transfer-mode-tab {
   display: inline-flex;
   align-items: center;
+  flex-shrink: 0;
+  white-space: nowrap;
   gap: 7px;
   border: none;
   background: transparent;
@@ -1565,6 +1589,10 @@
   background: var(--surface);
   color: var(--text-h);
   box-shadow: var(--shadow-sm);
+}
+
+.recurring-schedule-type-tabs {
+  margin-bottom: 14px;
 }
 
 .transfer-section {
@@ -2425,6 +2453,36 @@
   flex-wrap: wrap;
 }
 
+.budget-review-gate {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-top: 18px;
+  padding: 16px 18px;
+  border-radius: 14px;
+}
+
+.budget-review-gate h2 {
+  margin: 2px 0 4px;
+  font-size: 18px;
+}
+
+.budget-review-gate .secondary-btn {
+  flex-shrink: 0;
+}
+
+@media (max-width: 560px) {
+  .budget-review-gate {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .budget-review-gate .secondary-btn {
+    width: 100%;
+  }
+}
+
 .budget-unresolved-panel {
   margin-top: 18px;
 }
@@ -2477,6 +2535,19 @@
 .budget-unresolved-main span {
   color: var(--text);
   font-size: 12.5px;
+}
+
+/* .tx-automandate-tag/.tx-qr-tag are nested spans here too, but the generic
+   rule above (targeting every descendant span) would otherwise flatten
+   their pill colors/size back to plain gray text. */
+.budget-unresolved-main .tx-automandate-tag,
+.budget-unresolved-main .tx-qr-tag {
+  color: var(--accent);
+  font-size: 10px;
+}
+
+.budget-unresolved-main .tx-qr-tag {
+  color: var(--success);
 }
 
 .budget-unresolved-note-text {
@@ -2621,6 +2692,21 @@
   background: transparent;
 }
 
+.tx-load-more {
+  align-self: center;
+  margin-top: 10px;
+}
+
+.tx-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+
 .tx-row {
   display: flex;
   align-items: center;
@@ -2720,6 +2806,17 @@
   padding: 1px 7px;
 }
 
+.tx-qr-tag {
+  flex-shrink: 0;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--success);
+  background: var(--success-bg);
+  border-radius: 999px;
+  padding: 1px 7px;
+}
+
 .tx-note {
   font-size: 11px;
   font-style: italic;
@@ -2779,6 +2876,11 @@
 }
 
 .status-imported {
+  background: color-mix(in srgb, var(--accent-bg) 65%, white);
+  color: var(--accent);
+}
+
+.status-completed {
   background: color-mix(in srgb, var(--accent-bg) 65%, white);
   color: var(--accent);
 }
@@ -3704,6 +3806,27 @@
   box-shadow: 0 0 0 3px var(--accent-bg);
 }
 
+/* The generic .budget-input-wrap is a compact 28px-tall pill meant for dense
+   summary rows (e.g. budget limits) — next to this form's 44px description
+   input and select, that made the amount box look unstyled/nearly invisible. */
+.split-expense-form .budget-input-wrap {
+  min-height: 44px;
+  padding: 0 14px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+}
+
+.split-expense-form .budget-input-wrap:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-bg);
+}
+
+.split-expense-form .budget-input-wrap input {
+  min-height: auto;
+  padding-left: 8px;
+}
+
 .split-participant-chips {
   display: flex;
   flex-wrap: wrap;
@@ -3888,6 +4011,320 @@
   gap: 12px;
   font-size: 13.5px;
   color: var(--text);
+}
+
+.split-page {
+  --split-radius: 12px;
+}
+
+.split-page .panel {
+  border-radius: 12px;
+  padding: 18px;
+  box-shadow: 0 10px 28px rgba(15, 23, 42, 0.06);
+}
+
+.split-page .budget-panel-head {
+  align-items: flex-start;
+  gap: 14px;
+  margin-bottom: 14px;
+}
+
+.split-page .budget-panel-head h2 {
+  margin: 2px 0 0;
+  line-height: 1.2;
+}
+
+.split-overview-panel {
+  padding: 14px;
+}
+
+.split-overview-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.split-overview-item {
+  min-width: 0;
+  padding: 12px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--bg) 78%, var(--surface));
+}
+
+.split-overview-item span {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.split-overview-item strong {
+  display: block;
+  color: var(--text-h);
+  font-size: 18px;
+  line-height: 1.2;
+  overflow-wrap: anywhere;
+}
+
+.split-positive-text {
+  color: var(--success) !important;
+}
+
+.split-negative-text {
+  color: var(--danger) !important;
+}
+
+.split-create-form {
+  width: 100%;
+}
+
+.split-create-form .primary-btn,
+.split-expense-form .primary-btn {
+  align-self: flex-start;
+  min-width: 150px;
+}
+
+.split-create-form .gateway-label,
+.split-expense-form .gateway-label {
+  min-width: 0;
+}
+
+.split-create-form > label > input[type='text'],
+.split-expense-form input[type='text'],
+.split-expense-form .gateway-select,
+.split-add-member-row .input-with-icon input {
+  width: 100%;
+  min-width: 0;
+}
+
+.split-group-grid {
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+
+.split-group-card {
+  min-height: 132px;
+  border-radius: var(--split-radius);
+  background: var(--bg);
+}
+
+.split-group-card strong {
+  max-width: 100%;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+}
+
+.split-balance-grid {
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+}
+
+.split-balance-card {
+  min-width: 0;
+  border-radius: var(--split-radius);
+}
+
+.split-balance-card strong {
+  overflow-wrap: anywhere;
+}
+
+.split-balance-chip {
+  max-width: 100%;
+  min-height: 28px;
+  white-space: normal;
+  line-height: 1.25;
+}
+
+.split-add-member-row {
+  align-items: flex-start;
+}
+
+.split-add-member-row .search-field {
+  min-width: min(100%, 260px);
+}
+
+.split-page .suggestions-list {
+  z-index: 30;
+}
+
+.split-expense-form-row {
+  grid-template-columns: minmax(0, 1.15fr) minmax(0, 0.85fr);
+}
+
+.split-expense-form .budget-input-wrap,
+.split-custom-share-row .budget-input-wrap,
+.settlement-pay-modal .budget-input-wrap {
+  width: 100%;
+  min-width: 0;
+}
+
+.split-expense-form .budget-input-wrap input,
+.split-custom-share-row .budget-input-wrap input,
+.settlement-pay-modal .budget-input-wrap input {
+  width: 100%;
+  min-width: 0;
+}
+
+.split-participant-chips {
+  min-width: 0;
+}
+
+.split-chip {
+  max-width: 100%;
+  min-height: 34px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  line-height: 1.2;
+  overflow-wrap: anywhere;
+}
+
+.split-chip-removable {
+  padding-right: 8px;
+}
+
+.split-chip-removable button {
+  flex: 0 0 18px;
+  width: 18px;
+  height: 18px;
+  border-radius: 999px;
+}
+
+.split-chip-removable button:hover {
+  background: color-mix(in srgb, currentColor 12%, transparent);
+}
+
+.split-custom-shares {
+  padding: 12px;
+  border-radius: var(--split-radius);
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--bg) 72%, var(--surface));
+}
+
+.split-custom-share-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(128px, 160px);
+}
+
+.split-custom-share-row > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.split-expense-row {
+  border-radius: var(--split-radius);
+}
+
+.split-expense-main strong {
+  overflow-wrap: anywhere;
+}
+
+.split-expense-splits {
+  min-width: 0;
+}
+
+.split-expense-split-chip {
+  max-width: 100%;
+  min-height: 26px;
+  display: inline-flex;
+  align-items: center;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.split-settlement-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  border-radius: var(--split-radius);
+}
+
+.split-settlement-copy {
+  min-width: 0;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.split-settlement-amount {
+  font-weight: 800;
+  color: var(--text-h);
+  white-space: nowrap;
+}
+
+.split-settlement-progress {
+  display: block;
+  margin-top: 2px;
+  font-size: 12px;
+}
+
+.split-settlement-actions {
+  justify-content: flex-end;
+}
+
+.split-settlement-actions .primary-btn,
+.split-settlement-actions .secondary-btn {
+  min-height: 36px;
+  padding: 8px 12px;
+  border-radius: 9px;
+  white-space: nowrap;
+}
+
+.settlement-pay-modal {
+  width: min(400px, calc(100vw - 28px));
+}
+
+.settlement-pay-modal .split-chip {
+  width: 100%;
+  justify-content: center;
+  text-align: center;
+}
+
+@media (max-width: 760px) {
+  .split-overview-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .split-page .panel {
+    padding: 16px;
+  }
+
+  .split-settlement-row {
+    grid-template-columns: 1fr;
+  }
+
+  .split-settlement-actions {
+    width: 100%;
+    justify-content: stretch;
+  }
+
+  .split-settlement-actions .primary-btn,
+  .split-settlement-actions .secondary-btn {
+    flex: 1 1 130px;
+  }
+}
+
+@media (max-width: 560px) {
+  .split-overview-grid,
+  .split-expense-form-row,
+  .split-custom-share-row {
+    grid-template-columns: 1fr;
+  }
+
+  .split-create-form .primary-btn,
+  .split-expense-form .primary-btn {
+    width: 100%;
+  }
+
+  .split-add-member-row .search-field {
+    min-width: 100%;
+  }
+
+  .split-custom-share-row > span {
+    white-space: normal;
+  }
 }
 
 /* ---------- transaction management ---------- */
