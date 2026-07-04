@@ -70,7 +70,7 @@ router.delete(
     if (!cancelled) {
       return res.status(404).json({ error: { code: "RECURRING_NOT_FOUND", message: "Recurring payment not found" } });
     }
-    res.json({ success: true });
+    res.json({ success: true, action: cancelled.action });
   })
 );
 

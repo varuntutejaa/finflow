@@ -1,6 +1,13 @@
 import { randomUUID } from "crypto";
 import ExcelJS from "exceljs";
 import { pool, dbGet, dbAll, dbRun } from "./db.js";
+// Side-effect-only import: `investments.user_id` references `users(id)`, so
+// database.js's table creation must finish first. ES modules only guarantee
+// that ordering when there's an actual import edge — investmentDatabase.js
+// doesn't otherwise need anything from database.js, unlike
+// recurring/split/importDatabase.js which already import real functions
+// from it and get this ordering for free.
+import "./database.js";
 import { fetchMutualFundNav, resolveStockSymbol, fetchStockPrice } from "./priceFeeds.js";
 
 await pool.query(`

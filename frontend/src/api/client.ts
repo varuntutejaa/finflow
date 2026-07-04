@@ -601,7 +601,7 @@ export function createRecurringPayment(input: {
   return request('/api/recurring', { method: 'POST', body: JSON.stringify(input) })
 }
 
-export function cancelRecurringPayment(id: string): Promise<{ success: true }> {
+export function cancelRecurringPayment(id: string): Promise<{ success: true; action: 'cancelled' | 'deleted' }> {
   return request(`/api/recurring/${id}`, { method: 'DELETE' })
 }
 

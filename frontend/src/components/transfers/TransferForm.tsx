@@ -241,9 +241,22 @@ function ordinal(n: number) {
 
 function formatTimeLabel(time: string) {
   const [hh, mm] = time.split(':').map(Number)
+  if (!Number.isInteger(hh) || !Number.isInteger(mm)) return 'Select time'
   const period = hh >= 12 ? 'PM' : 'AM'
   const hour12 = hh % 12 === 0 ? 12 : hh % 12
   return `${hour12}:${mm.toString().padStart(2, '0')} ${period}`
+}
+
+function isValidTimeValue(time: string) {
+  const [hh, mm] = time.split(':').map(Number)
+  return Number.isInteger(hh) && Number.isInteger(mm) && hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59
+}
+
+function isValidDateValue(dateValue: string) {
+  const [year, month, day] = dateValue.split('-').map(Number)
+  if (!Number.isInteger(year) || !Number.isInteger(month) || !Number.isInteger(day)) return false
+  const date = new Date(year, month - 1, day)
+  return date.getFullYear() === year && date.getMonth() === month - 1 && date.getDate() === day
 }
 
 function defaultRecurringDate() {
@@ -273,6 +286,7 @@ function defaultOnceDate() {
 }
 
 function combineDateAndTime(dateValue: string, timeValue: string): Date {
+  if (!isValidDateValue(dateValue) || !isValidTimeValue(timeValue)) return new Date(Number.NaN)
   const [year, month, day] = dateValue.split('-').map(Number)
   const [hh, mm] = timeValue.split(':').map(Number)
   return new Date(year, month - 1, day, hh, mm, 0, 0)
@@ -287,6 +301,7 @@ function computeRecurringStartAt(
   weekday: number,
   monthDay: number
 ): Date {
+  if (!isValidTimeValue(time)) return new Date(Number.NaN)
   const [hh, mm] = time.split(':').map(Number)
   const now = new Date()
   const target = new Date(now.getFullYear(), now.getMonth(), now.getDate(), hh, mm, 0, 0)
@@ -489,18 +504,21 @@ export function TransferForm({
     return () => clearTimeout(handle)
   }, [recurToQuery, recurToUsername])
 
-  const loadRecurringPayments = () => {
+  const loadRecurringPayments = async () => {
     setRecurringLoading(true)
     setRecurringListError(null)
-    fetchRecurringPayments()
-      .then(setRecurringPayments)
-      .catch((err) => setRecurringListError(err instanceof Error ? err.message : 'Could not load recurring payments'))
-      .finally(() => setRecurringLoading(false))
+    try {
+      setRecurringPayments(await fetchRecurringPayments())
+    } catch (err) {
+      setRecurringListError(err instanceof Error ? err.message : 'Could not load recurring payments')
+    } finally {
+      setRecurringLoading(false)
+    }
   }
 
   useEffect(() => {
     if (mode !== 'recurring') return
-    loadRecurringPayments()
+    void loadRecurringPayments()
   }, [mode])
 
   useEffect(() => {
@@ -627,16 +645,17 @@ export function TransferForm({
     })
     setRecurPending(null)
     resetRecurringForm()
-    loadRecurringPayments()
+    await loadRecurringPayments()
   }
 
-  const handleCancelRecurring = async (id: string) => {
+  const handleCancelRecurring = async (payment: RecurringPayment) => {
+    const id = payment.id
     setRecurringCancellingId(id)
     try {
       await cancelRecurringPayment(id)
-      setRecurringPayments((current) => current.filter((p) => p.id !== id))
+      await loadRecurringPayments()
     } catch (err) {
-      setRecurringListError(err instanceof Error ? err.message : 'Could not cancel this recurring payment')
+      setRecurringListError(err instanceof Error ? err.message : payment.active ? 'Could not cancel this recurring payment' : 'Could not delete this mandate')
     } finally {
       setRecurringCancellingId(null)
     }
@@ -690,6 +709,10 @@ export function TransferForm({
       let frequency: RecurringFrequency
       if (recurScheduleType === 'once') {
         startAt = combineDateAndTime(recurOnceDate, recurOnceTime)
+        if (Number.isNaN(startAt.getTime())) {
+          setRecurError('Pick a valid date and time for this scheduled payment.')
+          return
+        }
         if (startAt.getTime() <= Date.now()) {
           setRecurError('Pick a date and time in the future for a one-time schedule.')
           return
@@ -697,6 +720,10 @@ export function TransferForm({
         frequency = 'once'
       } else {
         startAt = computeRecurringStartAt(recurFrequency, recurTime, recurWeekday, recurMonthDay)
+        if (Number.isNaN(startAt.getTime())) {
+          setRecurError('Pick a valid time for this recurring payment.')
+          return
+        }
         frequency = recurFrequency
       }
       setRecurPending({
@@ -1362,7 +1389,7 @@ export function TransferForm({
                     >
                       {accounts.map((a) => (
                         <option key={a.id} value={a.id}>
-                          {a.accountName} ({formatMoney(a.balance)})
+                          {a.accountName}
                         </option>
                       ))}
                     </select>
@@ -1382,7 +1409,7 @@ export function TransferForm({
                         .filter((a) => a.id !== ownFromAccountId)
                         .map((a) => (
                           <option key={a.id} value={a.id}>
-                            {a.accountName} ({formatMoney(a.balance)})
+                            {a.accountName}
                           </option>
                         ))}
                     </select>
@@ -1525,15 +1552,35 @@ export function TransferForm({
                           <button
                             type="button"
                             className="link-btn"
-                            onClick={() => handleCancelRecurring(p.id)}
+                            onClick={() => handleCancelRecurring(p)}
                             disabled={recurringCancellingId === p.id}
                           >
                             {recurringCancellingId === p.id ? 'Cancelling…' : 'Cancel'}
                           </button>
                         ) : p.frequency === 'once' && p.lastStatus === 'completed' ? (
-                          <span className="status-badge status-completed">completed</span>
+                          <>
+                            <span className="status-badge status-completed">completed</span>
+                            <button
+                              type="button"
+                              className="link-btn"
+                              onClick={() => handleCancelRecurring(p)}
+                              disabled={recurringCancellingId === p.id}
+                            >
+                              {recurringCancellingId === p.id ? 'Deleting…' : 'Delete'}
+                            </button>
+                          </>
                         ) : (
-                          <span className="status-badge status-failed">cancelled</span>
+                          <>
+                            <span className="status-badge status-failed">cancelled</span>
+                            <button
+                              type="button"
+                              className="link-btn"
+                              onClick={() => handleCancelRecurring(p)}
+                              disabled={recurringCancellingId === p.id}
+                            >
+                              {recurringCancellingId === p.id ? 'Deleting…' : 'Delete'}
+                            </button>
+                          </>
                         )}
                       </span>
                     </li>

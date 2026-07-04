@@ -26,15 +26,15 @@ export function verifyPassword(password, stored) {
 }
 
 const PIN_RE = /^\d{4}$/;
-const PIN_LOCKOUT_THRESHOLD = 3;
+const PIN_LOCKOUT_THRESHOLD = 5;
 const PIN_LOCKOUT_DURATION_MS = 24 * 60 * 60 * 1000;
 
 // Checks a payment/verification attempt against the account's UPI PIN.
 // Returns null when authorized, or an { status, code, message } describing
-// why it wasn't. Three wrong PINs in a row (across any PIN-gated action)
+// why it wasn't. Five wrong PINs in a row (across any PIN-gated action)
 // locks the account for 24 hours — a correct PIN resets the streak, and the
 // streak itself is cleared once the lockout window has fully elapsed, so a
-// stale lockout never blocks a fresh set of 3 attempts.
+// stale lockout never blocks a fresh set of 5 attempts.
 export async function checkPinAuthorization(user, pin) {
   let failedAttempts = await listFailedPinAttempts(user.id); // newest first
   if (failedAttempts.length >= PIN_LOCKOUT_THRESHOLD) {

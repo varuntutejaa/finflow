@@ -16,6 +16,22 @@ export const pool = new pg.Pool({
   connectionString: databaseUrl,
 });
 
+// A reusable stand-in for SQLite's strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+// used as a column default/update expression across every config file's
+// schema. Created here (rather than in database.js) because every config
+// file imports from this module directly — ES modules only guarantee a
+// dependency's top-level await finishes before a dependent's own top-level
+// code runs when there's an actual import edge between them. database.js
+// and investmentDatabase.js are siblings with no edge to each other (both
+// just depend on this file), so creating it in database.js let the two
+// modules' schema-init awaits race depending on network timing — this
+// showed up as an intermittent "function iso_now() does not exist" error.
+await pool.query(`
+  CREATE OR REPLACE FUNCTION iso_now() RETURNS TEXT AS $$
+    SELECT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"');
+  $$ LANGUAGE SQL VOLATILE;
+`);
+
 function normalizeQuery(sql, args) {
   const isNamedParams = args.length === 1 && args[0] !== null && typeof args[0] === "object" && !Array.isArray(args[0]);
 

@@ -73,7 +73,9 @@ const INSERT_RECURRING_SQL = `
   VALUES (@id, @userId, @fromAccountId, @toUsername, @category, @amount, @frequency, @nextRunAt)
 `;
 const LIST_RECURRING_SQL = `${RECURRING_SELECT} WHERE r.user_id = ? ORDER BY r.next_run_at ASC`;
-const CANCEL_RECURRING_SQL = "UPDATE recurring_payments SET active = 0 WHERE id = @id AND user_id = @userId";
+const GET_RECURRING_OWNER_SQL = "SELECT active FROM recurring_payments WHERE id = ? AND user_id = ?";
+const CANCEL_RECURRING_SQL = "UPDATE recurring_payments SET active = 0 WHERE id = @id AND user_id = @userId AND active = 1";
+const DELETE_CANCELLED_RECURRING_SQL = "DELETE FROM recurring_payments WHERE id = @id AND user_id = @userId AND active = 0";
 const LIST_DUE_SQL = "SELECT * FROM recurring_payments WHERE active = 1 AND next_run_at <= ?";
 const ADVANCE_RECURRING_SQL = `
   UPDATE recurring_payments
@@ -136,8 +138,16 @@ export async function listRecurringPayments(userId) {
 }
 
 export async function cancelRecurringPayment(userId, id) {
-  const result = await dbRun(CANCEL_RECURRING_SQL, { id, userId });
-  return result.changes > 0;
+  const existing = await dbGet(GET_RECURRING_OWNER_SQL, id, userId);
+  if (!existing) return null;
+
+  if (Boolean(existing.active)) {
+    const result = await dbRun(CANCEL_RECURRING_SQL, { id, userId });
+    return result.changes > 0 ? { action: "cancelled" } : null;
+  }
+
+  const result = await dbRun(DELETE_CANCELLED_RECURRING_SQL, { id, userId });
+  return result.changes > 0 ? { action: "deleted" } : null;
 }
 
 // Runs every tick of the in-process scheduler (see server.js) — picks up
