@@ -190,6 +190,7 @@ function App() {
     toName: string
     amount: number
     category: string
+    note: string | null
   } | null>(null)
   // null until the first successful load — prevents flagging every existing
   // auto-mandate transaction as "new" the moment the app opens.
@@ -271,6 +272,7 @@ function App() {
             toName: newAutoMandate.toName,
             amount: newAutoMandate.amount,
             category: newAutoMandate.category,
+            note: newAutoMandate.note,
           })
         }
       }
@@ -753,7 +755,7 @@ function App() {
       {autoMandateAlert && (
         <div className="auto-mandate-toast" role="status" aria-live="polite">
           <div className="auto-mandate-toast-copy">
-            <strong>Auto mandate debited</strong>
+            <strong>{autoMandateAlert.note === 'Scheduled payment' ? 'Scheduled payment sent' : 'Auto mandate debited'}</strong>
             <span>
               {formatMoney(autoMandateAlert.amount)} sent to {autoMandateAlert.toName} · {titleCase(autoMandateAlert.category)}
             </span>

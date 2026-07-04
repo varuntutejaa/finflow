@@ -1,7 +1,7 @@
 import { randomUUID } from "crypto";
 import db, { transfer, getAccount, findUserByUsername, normalizeBudgetCategory, TransferError } from "./database.js";
 
-db.exec(`
+const RECURRING_TABLE_DDL = `
   CREATE TABLE IF NOT EXISTS recurring_payments (
     id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL REFERENCES users(id),
@@ -9,7 +9,7 @@ db.exec(`
     to_username TEXT NOT NULL,
     category TEXT NOT NULL DEFAULT 'other',
     amount INTEGER NOT NULL CHECK (amount > 0),
-    frequency TEXT NOT NULL CHECK (frequency IN ('daily', 'weekly', 'monthly')),
+    frequency TEXT NOT NULL CHECK (frequency IN ('once', 'daily', 'weekly', 'monthly')),
     next_run_at TEXT NOT NULL,
     last_run_at TEXT,
     last_status TEXT,
@@ -19,7 +19,22 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_recurring_user ON recurring_payments(user_id);
   CREATE INDEX IF NOT EXISTS idx_recurring_due ON recurring_payments(active, next_run_at);
-`);
+`;
+
+db.exec(RECURRING_TABLE_DDL);
+
+// SQLite can't alter a CHECK constraint in place — databases created before
+// "once" (schedule-ahead, single-run) existed still have the old
+// frequency CHECK and would reject inserts. Rebuild the table in that case.
+const existingRecurringTable = db
+  .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'recurring_payments'")
+  .get();
+if (existingRecurringTable && !existingRecurringTable.sql.includes("'once'")) {
+  db.exec("ALTER TABLE recurring_payments RENAME TO recurring_payments_pre_once");
+  db.exec(RECURRING_TABLE_DDL);
+  db.exec("INSERT INTO recurring_payments SELECT * FROM recurring_payments_pre_once");
+  db.exec("DROP TABLE recurring_payments_pre_once");
+}
 
 export class RecurringPaymentError extends Error {
   constructor(status, code, message) {
@@ -29,7 +44,9 @@ export class RecurringPaymentError extends Error {
   }
 }
 
-const FREQUENCIES = ["daily", "weekly", "monthly"];
+// "once" is a single scheduled transfer for a future date/time (schedule
+// ahead, no repeat); the rest repeat on a fixed cadence until cancelled.
+const FREQUENCIES = ["once", "daily", "weekly", "monthly"];
 
 function advanceDate(iso, frequency) {
   const date = new Date(iso);
@@ -74,7 +91,7 @@ const cancelRecurringStmt = db.prepare("UPDATE recurring_payments SET active = 0
 const listDueStmt = db.prepare("SELECT * FROM recurring_payments WHERE active = 1 AND next_run_at <= ?");
 const advanceRecurringStmt = db.prepare(`
   UPDATE recurring_payments
-  SET next_run_at = @nextRunAt, last_run_at = @lastRunAt, last_status = @lastStatus
+  SET next_run_at = @nextRunAt, last_run_at = @lastRunAt, last_status = @lastStatus, active = @active
   WHERE id = @id
 `);
 
@@ -83,7 +100,13 @@ export function createRecurringPayment({ userId, fromAccountId, toUsername, amou
     throw new RecurringPaymentError(400, "INVALID_AMOUNT", "amount must be a positive integer (cents)");
   }
   if (!FREQUENCIES.includes(frequency)) {
-    throw new RecurringPaymentError(400, "INVALID_FREQUENCY", "frequency must be daily, weekly, or monthly");
+    throw new RecurringPaymentError(400, "INVALID_FREQUENCY", "frequency must be once, daily, weekly, or monthly");
+  }
+  if (frequency === "once") {
+    const parsed = startAt ? new Date(startAt) : null;
+    if (!parsed || Number.isNaN(parsed.getTime()) || parsed.getTime() <= Date.now()) {
+      throw new RecurringPaymentError(400, "INVALID_START_AT", "startAt must be a future date for a one-time schedule");
+    }
   }
   if (typeof toUsername !== "string" || toUsername.trim().length === 0) {
     throw new RecurringPaymentError(400, "INVALID_ACCOUNT", "toUsername is required");
@@ -150,17 +173,23 @@ export function runDueRecurringPayments(now = new Date().toISOString()) {
         category: row.category,
         idempotencyKey: `recurring:${row.id}:${row.next_run_at}`,
         isAutoMandate: true,
+        // Lets the frontend's auto-mandate toast tell a one-off scheduled
+        // payment apart from a repeating one, without a separate column.
+        note: row.frequency === "once" ? "Scheduled payment" : "Recurring payment",
       });
       if (transaction.status === "failed") status = "failed";
     } catch (err) {
       if (!(err instanceof TransferError)) throw err;
       status = "failed";
     }
+    // A "once" mandate never repeats — deactivate it right after its single
+    // run instead of computing a next occurrence.
     advanceRecurringStmt.run({
       id: row.id,
-      nextRunAt: advanceDate(row.next_run_at, row.frequency),
+      nextRunAt: row.frequency === "once" ? row.next_run_at : advanceDate(row.next_run_at, row.frequency),
       lastRunAt: now,
       lastStatus: status,
+      active: row.frequency === "once" ? 0 : 1,
     });
     results.push({ id: row.id, status });
   }

@@ -141,9 +141,10 @@ export function TransactionHistory({ transactions, currentUsername, loading }: P
                   <span className="tx-label">{label}</span>
                   {username && <span className="tx-username">@{username}</span>}
                   <span className="tx-time">{new Date(tx.createdAt).toLocaleString()}</span>
-                  {(tx.category || tx.note || tx.isAutoMandate) && (
+                  {(tx.category || tx.note || tx.isAutoMandate || tx.isQrPayment) && (
                     <span className="tx-meta">
                       {tx.isAutoMandate && <span className="tx-automandate-tag">Auto mandate</span>}
+                      {tx.isQrPayment && <span className="tx-qr-tag">QR</span>}
                       {tx.category && <span className="tx-category-tag">{tx.category}</span>}
                       {tx.note && <span className="tx-note">{tx.note}</span>}
                     </span>

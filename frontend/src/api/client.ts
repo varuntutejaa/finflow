@@ -40,6 +40,7 @@ export interface Transaction {
   status: 'completed' | 'failed'
   failureReason: string | null
   isAutoMandate: boolean
+  isQrPayment: boolean
   createdAt: string
 }
 
@@ -358,6 +359,7 @@ export function transfer(input: {
   pin: string
   category: string
   note?: string
+  isQrPayment?: boolean
 }): Promise<{ transaction: Transaction; replayed: boolean; accounts: Account[] }> {
   return request('/api/transactions/transfer', {
     method: 'POST',
@@ -534,7 +536,7 @@ export function fetchSpendingAnalytics(filters: { dateFrom?: string; dateTo?: st
   return request(`/api/analytics/spending${qs ? `?${qs}` : ''}`)
 }
 
-export type RecurringFrequency = 'daily' | 'weekly' | 'monthly'
+export type RecurringFrequency = 'once' | 'daily' | 'weekly' | 'monthly'
 
 export interface RecurringPayment {
   id: string

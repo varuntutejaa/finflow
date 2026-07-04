@@ -39,7 +39,7 @@ function enforceTransferRateLimit(req, res, next) {
 }
 
 router.post("/transfer", enforceTransferRateLimit, (req, res) => {
-  const { fromAccountId, toUsername, amount, idempotencyKey, pin, category, note } = req.body ?? {};
+  const { fromAccountId, toUsername, amount, idempotencyKey, pin, category, note, isQrPayment } = req.body ?? {};
 
   if (typeof fromAccountId !== "string" || typeof toUsername !== "string" || toUsername.trim().length === 0) {
     return res
@@ -110,6 +110,7 @@ router.post("/transfer", enforceTransferRateLimit, (req, res) => {
       idempotencyKey,
       category,
       note,
+      isQrPayment: Boolean(isQrPayment),
     });
     res.status(replayed ? 200 : 201).json({
       transaction,

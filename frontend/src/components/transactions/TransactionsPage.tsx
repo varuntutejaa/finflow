@@ -438,6 +438,7 @@ export function TransactionsPage({ accounts, categories, currentUsername, onBack
 
                   <div className="tx-manage-meta">
                     {tx.isAutoMandate && <span className="tx-automandate-tag">Auto mandate</span>}
+                    {tx.isQrPayment && <span className="tx-qr-tag">QR</span>}
                     <span className="split-expense-split-chip">{titleCase(tx.category)}</span>
                     <span className={`tx-amount ${failed ? 'tx-amount-failed' : outgoing ? 'tx-amount-out' : 'tx-amount-in'}`}>
                       {failed ? '' : outgoing ? '−' : '+'}

@@ -879,6 +879,7 @@
   background: linear-gradient(135deg, var(--accent), color-mix(in srgb, var(--accent-2) 72%, var(--accent)));
   color: #fff;
   box-shadow: 0 8px 20px color-mix(in srgb, var(--accent) 35%, transparent);
+  transition: transform 0.15s ease, box-shadow 0.15s ease, filter 0.15s ease;
 
   @media (max-width: 480px) {
     padding: 8px 18px;
@@ -890,11 +891,30 @@
   width: 17px;
   height: 17px;
   flex-shrink: 0;
+  transition: transform 0.15s ease;
 }
 
 .navbar-tab-pay-center:hover {
   color: #fff;
-  filter: brightness(1.05);
+  filter: brightness(1.08);
+  transform: translateY(-2px);
+  box-shadow: 0 12px 26px color-mix(in srgb, var(--accent) 42%, transparent);
+}
+
+.navbar-tab-pay-center:hover svg {
+  transform: scale(1.1) rotate(-8deg);
+}
+
+.navbar-tab-pay-center:active {
+  transform: translateY(0) scale(0.96);
+  filter: brightness(0.97);
+  box-shadow: 0 4px 12px color-mix(in srgb, var(--accent) 35%, transparent);
+  transition: transform 0.05s ease, box-shadow 0.05s ease, filter 0.05s ease;
+}
+
+.navbar-tab-pay-center:focus-visible {
+  outline: 2px solid #fff;
+  outline-offset: 2px;
 }
 
 .navbar-tab-pay-center-active {
@@ -1565,6 +1585,10 @@
   background: var(--surface);
   color: var(--text-h);
   box-shadow: var(--shadow-sm);
+}
+
+.recurring-schedule-type-tabs {
+  margin-bottom: 14px;
 }
 
 .transfer-section {
@@ -2720,6 +2744,17 @@
   padding: 1px 7px;
 }
 
+.tx-qr-tag {
+  flex-shrink: 0;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--success);
+  background: var(--success-bg);
+  border-radius: 999px;
+  padding: 1px 7px;
+}
+
 .tx-note {
   font-size: 11px;
   font-style: italic;
@@ -2779,6 +2814,11 @@
 }
 
 .status-imported {
+  background: color-mix(in srgb, var(--accent-bg) 65%, white);
+  color: var(--accent);
+}
+
+.status-completed {
   background: color-mix(in srgb, var(--accent-bg) 65%, white);
   color: var(--accent);
 }
@@ -3702,6 +3742,27 @@
   outline: none;
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-bg);
+}
+
+/* The generic .budget-input-wrap is a compact 28px-tall pill meant for dense
+   summary rows (e.g. budget limits) — next to this form's 44px description
+   input and select, that made the amount box look unstyled/nearly invisible. */
+.split-expense-form .budget-input-wrap {
+  min-height: 44px;
+  padding: 0 14px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+}
+
+.split-expense-form .budget-input-wrap:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-bg);
+}
+
+.split-expense-form .budget-input-wrap input {
+  min-height: auto;
+  padding-left: 8px;
 }
 
 .split-participant-chips {

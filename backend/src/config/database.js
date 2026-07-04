@@ -121,6 +121,9 @@ if (!transactionColumns.includes("reference_number")) {
 if (!transactionColumns.includes("is_auto_mandate")) {
   db.exec("ALTER TABLE transactions ADD COLUMN is_auto_mandate INTEGER NOT NULL DEFAULT 0");
 }
+if (!transactionColumns.includes("is_qr_payment")) {
+  db.exec("ALTER TABLE transactions ADD COLUMN is_qr_payment INTEGER NOT NULL DEFAULT 0");
+}
 
 db.exec("CREATE INDEX IF NOT EXISTS idx_transactions_created_at ON transactions(created_at)");
 db.exec("CREATE INDEX IF NOT EXISTS idx_transactions_category ON transactions(category)");
@@ -193,6 +196,7 @@ function toTransactionJSON(row) {
     status: row.status,
     failureReason: row.failure_reason,
     isAutoMandate: Boolean(row.is_auto_mandate),
+    isQrPayment: Boolean(row.is_qr_payment),
     createdAt: row.created_at,
   };
 }
@@ -510,8 +514,8 @@ const creditAccountStmt = db.prepare(
   "UPDATE accounts SET balance = balance + @amount WHERE id = @accountId"
 );
 const insertTransactionStmt = db.prepare(`
-  INSERT INTO transactions (id, reference_number, initiated_by_user_id, idempotency_key, from_account_id, to_account_id, category, amount, status, failure_reason, note, is_auto_mandate)
-  VALUES (@id, @referenceNumber, @userId, @idempotencyKey, @fromAccountId, @toAccountId, @category, @amount, @status, @failureReason, @note, @isAutoMandate)
+  INSERT INTO transactions (id, reference_number, initiated_by_user_id, idempotency_key, from_account_id, to_account_id, category, amount, status, failure_reason, note, is_auto_mandate, is_qr_payment)
+  VALUES (@id, @referenceNumber, @userId, @idempotencyKey, @fromAccountId, @toAccountId, @category, @amount, @status, @failureReason, @note, @isAutoMandate, @isQrPayment)
 `);
 const getTransactionRawStmt = db.prepare(`${TRANSACTION_SELECT} WHERE t.id = ?`);
 const getTransactionByIdempotencyKeyStmt = db.prepare(
@@ -618,7 +622,7 @@ function resolveDestinationAccountId(userId, fromAccountId, toUsername) {
 // A failed (insufficient-funds) attempt still commits as a history row — only
 // throwing here would roll back that audit record along with everything else.
 const transferTxn = db.transaction(
-  ({ id, userId, idempotencyKey, fromAccountId, toUsername, amount, category, note, isAutoMandate }) => {
+  ({ id, userId, idempotencyKey, fromAccountId, toUsername, amount, category, note, isAutoMandate, isQrPayment }) => {
     const referenceNumber = generateReferenceNumber();
     const from = getAccountRawStmt.get(fromAccountId);
     if (!from || from.user_id !== userId) {
@@ -641,6 +645,7 @@ const transferTxn = db.transaction(
         failureReason: "insufficient_funds",
         note,
         isAutoMandate: isAutoMandate ? 1 : 0,
+        isQrPayment: isQrPayment ? 1 : 0,
       });
       return getTransactionRawStmt.get(id);
     }
@@ -660,6 +665,7 @@ const transferTxn = db.transaction(
         failureReason: "insufficient_funds",
         note,
         isAutoMandate: isAutoMandate ? 1 : 0,
+        isQrPayment: isQrPayment ? 1 : 0,
       });
       return getTransactionRawStmt.get(id);
     }
@@ -682,13 +688,14 @@ const transferTxn = db.transaction(
       failureReason: null,
       note,
       isAutoMandate: isAutoMandate ? 1 : 0,
+      isQrPayment: isQrPayment ? 1 : 0,
     });
 
     return getTransactionRawStmt.get(id);
   }
 );
 
-export function transfer({ userId, fromAccountId, toUsername, amount, idempotencyKey, category, note, isAutoMandate }) {
+export function transfer({ userId, fromAccountId, toUsername, amount, idempotencyKey, category, note, isAutoMandate, isQrPayment }) {
   if (!Number.isSafeInteger(amount) || amount <= 0) {
     throw new TransferError(400, "INVALID_AMOUNT", "amount must be a positive integer (cents)");
   }
@@ -725,6 +732,7 @@ export function transfer({ userId, fromAccountId, toUsername, amount, idempotenc
       amount,
       note: normalizedNote,
       isAutoMandate: Boolean(isAutoMandate),
+      isQrPayment: Boolean(isQrPayment),
     });
     if (transaction.status === "failed") {
       throw insufficientFundsError(transaction);
@@ -780,6 +788,7 @@ const ownAccountTransferTxn = db.transaction(({ id, userId, idempotencyKey, from
       failureReason: "insufficient_funds",
       note,
       isAutoMandate: 0,
+      isQrPayment: 0,
     });
     return getTransactionRawStmt.get(id);
   }
@@ -799,6 +808,7 @@ const ownAccountTransferTxn = db.transaction(({ id, userId, idempotencyKey, from
       failureReason: "insufficient_funds",
       note,
       isAutoMandate: 0,
+      isQrPayment: 0,
     });
     return getTransactionRawStmt.get(id);
   }
@@ -818,6 +828,7 @@ const ownAccountTransferTxn = db.transaction(({ id, userId, idempotencyKey, from
     failureReason: null,
     note,
     isAutoMandate: 0,
+    isQrPayment: 0,
   });
 
   return getTransactionRawStmt.get(id);

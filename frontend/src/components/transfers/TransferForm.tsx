@@ -17,6 +17,7 @@ import {
 import { PinModal } from '../shared/PinModal'
 import { PayConfirmPopup } from './PayConfirmPopup'
 import { ScanQrModal } from './ScanQrModal'
+import { playSuccessTing } from '../../utils/sound'
 
 function parseQrPayLink(data: string): { username: string; name: string } | null {
   try {
@@ -113,6 +114,7 @@ interface PendingPersonTransfer {
   amountCents: number
   idempotencyKey: string
   settlementContext?: { groupId: string; settlementId: string } | null
+  isQrPayment?: boolean
 }
 
 interface PendingOwnTransfer {
@@ -208,6 +210,7 @@ function hasValidCurrencyPrecision(value: string) {
 }
 
 function frequencyLabel(frequency: RecurringFrequency) {
+  if (frequency === 'once') return 'one-time'
   return frequency === 'daily' ? 'every day' : frequency === 'weekly' ? 'every week' : 'every month'
 }
 
@@ -251,6 +254,28 @@ function defaultRecurringDate() {
 
 function timeInputValue(date: Date) {
   return `${date.getHours().toString().padStart(2, '0')}:${date.getMinutes().toString().padStart(2, '0')}`
+}
+
+function dateInputValue(date: Date) {
+  return `${date.getFullYear()}-${(date.getMonth() + 1).toString().padStart(2, '0')}-${date
+    .getDate()
+    .toString()
+    .padStart(2, '0')}`
+}
+
+// Default the one-time picker to an hour from now so it's always valid
+// (schedule-once requires a future date/time) without the user having to
+// change anything for the common "later today" case.
+function defaultOnceDate() {
+  const date = new Date()
+  date.setHours(date.getHours() + 1, 0, 0, 0)
+  return date
+}
+
+function combineDateAndTime(dateValue: string, timeValue: string): Date {
+  const [year, month, day] = dateValue.split('-').map(Number)
+  const [hh, mm] = timeValue.split(':').map(Number)
+  return new Date(year, month - 1, day, hh, mm, 0, 0)
 }
 
 // Resolves the frequency-specific schedule (weekday for weekly, day-of-month
@@ -339,10 +364,13 @@ export function TransferForm({
   const [recurSuggestions, setRecurSuggestions] = useState<UserSearchResult[]>([])
   const [recurAmount, setRecurAmount] = useState('')
   const [recurCategory, setRecurCategory] = useState<string>('other')
+  const [recurScheduleType, setRecurScheduleType] = useState<'once' | 'regular'>('regular')
   const [recurFrequency, setRecurFrequency] = useState<RecurringFrequency>('monthly')
   const [recurTime, setRecurTime] = useState(() => timeInputValue(defaultRecurringDate()))
   const [recurWeekday, setRecurWeekday] = useState(() => defaultRecurringDate().getDay())
   const [recurMonthDay, setRecurMonthDay] = useState(() => defaultRecurringDate().getDate())
+  const [recurOnceDate, setRecurOnceDate] = useState(() => dateInputValue(defaultOnceDate()))
+  const [recurOnceTime, setRecurOnceTime] = useState(() => timeInputValue(defaultOnceDate()))
   const [recurError, setRecurError] = useState<string | null>(null)
   const [recurPending, setRecurPending] = useState<{
     toUsername: string
@@ -486,7 +514,7 @@ export function TransferForm({
     return () => document.removeEventListener('mousedown', handleClickOutside)
   }, [])
 
-  const startPersonPayFlow = (username: string, label: string) => {
+  const startPersonPayFlow = (username: string, label: string, isQrPayment = false) => {
     const fromAccount = defaultAccount
     if (!fromAccount) {
       setError('No source account is available right now.')
@@ -502,10 +530,11 @@ export function TransferForm({
       amountCents: 0,
       idempotencyKey: crypto.randomUUID(),
       settlementContext: null,
+      isQrPayment,
     })
   }
 
-  const selectRecipient = (user: UserSearchResult) => {
+  const selectRecipient = (user: UserSearchResult, isQrPayment = false) => {
     setToUsername(user.username)
     setToQuery(`${user.name} (@${user.username})`)
     setSelectedRecipient(user)
@@ -514,13 +543,13 @@ export function TransferForm({
     // straight to the pay popup — no separate "Pay" click needed. The amount
     // is entered inside that popup alongside the note and budget category.
     if (mode === 'person' && !settlementPrefill && !qrPrefill) {
-      startPersonPayFlow(user.username, `${user.name} (@${user.username})`)
+      startPersonPayFlow(user.username, `${user.name} (@${user.username})`, isQrPayment)
     }
   }
 
   const handleQrScanned = ({ username, name }: { username: string; name: string }) => {
     setScanningQr(false)
-    selectRecipient({ id: username, username, name, email: '', isSelf: false })
+    selectRecipient({ id: username, username, name, email: '', isSelf: false }, true)
   }
 
   const selectFrequentContact = (contact: { username: string; name: string }) => {
@@ -565,15 +594,19 @@ export function TransferForm({
 
   const resetRecurringForm = () => {
     const defaultDate = defaultRecurringDate()
+    const defaultOnce = defaultOnceDate()
     setRecurToQuery('')
     setRecurToUsername('')
     setRecurSelectedRecipient(null)
     setRecurAmount('')
     setRecurCategory('other')
+    setRecurScheduleType('regular')
     setRecurFrequency('monthly')
     setRecurTime(timeInputValue(defaultDate))
     setRecurWeekday(defaultDate.getDay())
     setRecurMonthDay(defaultDate.getDate())
+    setRecurOnceDate(dateInputValue(defaultOnce))
+    setRecurOnceTime(timeInputValue(defaultOnce))
     setRecurError(null)
   }
 
@@ -614,9 +647,12 @@ export function TransferForm({
     if (paymentPopup || pending || recurPending) return
     if (nextMode === 'recurring' && mode !== 'recurring') {
       const defaultDate = defaultRecurringDate()
+      const defaultOnce = defaultOnceDate()
       setRecurTime(timeInputValue(defaultDate))
       setRecurWeekday(defaultDate.getDay())
       setRecurMonthDay(defaultDate.getDate())
+      setRecurOnceDate(dateInputValue(defaultOnce))
+      setRecurOnceTime(timeInputValue(defaultOnce))
     }
     setMode(nextMode)
     setError(null)
@@ -651,13 +687,25 @@ export function TransferForm({
         setRecurError(`A single payment can be at most ${formatMoney(MAX_TRANSFER_AMOUNT_PAISE)}.`)
         return
       }
-      const startAt = computeRecurringStartAt(recurFrequency, recurTime, recurWeekday, recurMonthDay)
+      let startAt: Date
+      let frequency: RecurringFrequency
+      if (recurScheduleType === 'once') {
+        startAt = combineDateAndTime(recurOnceDate, recurOnceTime)
+        if (startAt.getTime() <= Date.now()) {
+          setRecurError('Pick a date and time in the future for a one-time schedule.')
+          return
+        }
+        frequency = 'once'
+      } else {
+        startAt = computeRecurringStartAt(recurFrequency, recurTime, recurWeekday, recurMonthDay)
+        frequency = recurFrequency
+      }
       setRecurPending({
         toUsername: recurToUsername,
         toLabel: recurSelectedRecipient?.name ?? recurToQuery,
         amountCents: cents,
         category: recurCategory,
-        frequency: recurFrequency,
+        frequency,
         startAt: startAt.toISOString(),
       })
       return
@@ -745,6 +793,7 @@ export function TransferForm({
       settlementContext: settlementPrefill
         ? { groupId: settlementPrefill.groupId, settlementId: settlementPrefill.settlementId }
         : null,
+      isQrPayment: Boolean(qrPrefill),
     })
   }
 
@@ -795,11 +844,13 @@ export function TransferForm({
               pin,
               category: transferRequest.category,
               note: transferRequest.note,
+              isQrPayment: transferRequest.isQrPayment,
             })
       setPending(null)
       setPayConfirmed(false)
 
       await wait(3000)
+      playSuccessTing()
       setPaymentPopup({
         stage: 'done',
         amountCents: transferRequest.amountCents,
@@ -1129,97 +1180,172 @@ export function TransferForm({
                     </div>
                   </label>
 
-                  <div className="fields-row">
-                    <label className="gateway-label">
-                      <span className="transfer-section-head">
-                        <span className="transfer-section-kicker">Category</span>
-                      </span>
-                      <select
-                        className="gateway-select"
-                        value={recurCategory}
-                        onChange={(e) => setRecurCategory(e.target.value)}
-                      >
-                        <option value="other">Settle later</option>
-                        {categoryOptions.map((item) => (
-                          <option key={item} value={item}>
-                            {item.charAt(0).toUpperCase() + item.slice(1)}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-
-                    <label className="gateway-label">
-                      <span className="transfer-section-head">
-                        <span className="transfer-section-kicker">Frequency</span>
-                      </span>
-                      <select
-                        className="gateway-select"
-                        value={recurFrequency}
-                        onChange={(e) => setRecurFrequency(e.target.value as RecurringFrequency)}
-                      >
-                        <option value="daily">Daily</option>
-                        <option value="weekly">Weekly</option>
-                        <option value="monthly">Monthly</option>
-                      </select>
-                    </label>
-
-                    <label className="gateway-label">
-                      <span className="transfer-section-head">
-                        <span className="transfer-section-kicker">Time</span>
-                      </span>
-                      <input
-                        type="time"
-                        className="gateway-select"
-                        value={recurTime}
-                        onChange={(e) => setRecurTime(e.target.value)}
-                      />
-                    </label>
-
-                    {recurFrequency === 'monthly' && (
-                      <label className="gateway-label">
-                        <span className="transfer-section-head">
-                          <span className="transfer-section-kicker">Day of month</span>
-                        </span>
-                        <select
-                          className="gateway-select"
-                          value={recurMonthDay}
-                          onChange={(e) => setRecurMonthDay(Number(e.target.value))}
-                        >
-                          {Array.from({ length: 31 }, (_, i) => i + 1).map((d) => (
-                            <option key={d} value={d}>
-                              {ordinal(d)}
-                            </option>
-                          ))}
-                        </select>
-                      </label>
-                    )}
+                  <div className="transfer-mode-tabs recurring-schedule-type-tabs">
+                    <button
+                      type="button"
+                      className={`transfer-mode-tab${recurScheduleType === 'regular' ? ' transfer-mode-tab-active' : ''}`}
+                      onClick={() => setRecurScheduleType('regular')}
+                      aria-pressed={recurScheduleType === 'regular'}
+                    >
+                      Regular schedule
+                    </button>
+                    <button
+                      type="button"
+                      className={`transfer-mode-tab${recurScheduleType === 'once' ? ' transfer-mode-tab-active' : ''}`}
+                      onClick={() => setRecurScheduleType('once')}
+                      aria-pressed={recurScheduleType === 'once'}
+                    >
+                      Schedule once
+                    </button>
                   </div>
 
-                  {recurFrequency === 'weekly' && (
-                    <div className="recurring-weekday-picker">
-                      <span className="transfer-section-kicker">Day of week</span>
-                      <div className="recurring-weekday-options">
-                        {WEEKDAYS.map((d) => (
-                          <button
-                            key={d.value}
-                            type="button"
-                            className={`recurring-weekday-chip${recurWeekday === d.value ? ' recurring-weekday-chip-active' : ''}`}
-                            onClick={() => setRecurWeekday(d.value)}
+                  {recurScheduleType === 'once' ? (
+                    <>
+                      <div className="fields-row">
+                        <label className="gateway-label">
+                          <span className="transfer-section-head">
+                            <span className="transfer-section-kicker">Category</span>
+                          </span>
+                          <select
+                            className="gateway-select"
+                            value={recurCategory}
+                            onChange={(e) => setRecurCategory(e.target.value)}
                           >
-                            {d.label}
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-                  )}
+                            <option value="other">Settle later</option>
+                            {categoryOptions.map((item) => (
+                              <option key={item} value={item}>
+                                {item.charAt(0).toUpperCase() + item.slice(1)}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
 
-                  <p className="transfer-section-meta recurring-schedule-summary">
-                    {recurFrequency === 'daily' && `Debits every day at ${formatTimeLabel(recurTime)}`}
-                    {recurFrequency === 'weekly' &&
-                      `Debits every ${WEEKDAYS.find((d) => d.value === recurWeekday)?.full} at ${formatTimeLabel(recurTime)}`}
-                    {recurFrequency === 'monthly' &&
-                      `Debits every ${ordinal(recurMonthDay)} of the month at ${formatTimeLabel(recurTime)}`}
-                  </p>
+                        <label className="gateway-label">
+                          <span className="transfer-section-head">
+                            <span className="transfer-section-kicker">Date</span>
+                          </span>
+                          <input
+                            type="date"
+                            className="gateway-select"
+                            value={recurOnceDate}
+                            min={dateInputValue(new Date())}
+                            onChange={(e) => setRecurOnceDate(e.target.value)}
+                          />
+                        </label>
+
+                        <label className="gateway-label">
+                          <span className="transfer-section-head">
+                            <span className="transfer-section-kicker">Time</span>
+                          </span>
+                          <input
+                            type="time"
+                            className="gateway-select"
+                            value={recurOnceTime}
+                            onChange={(e) => setRecurOnceTime(e.target.value)}
+                          />
+                        </label>
+                      </div>
+
+                      <p className="transfer-section-meta recurring-schedule-summary">
+                        Debits once on {new Date(`${recurOnceDate}T00:00:00`).toLocaleDateString()} at{' '}
+                        {formatTimeLabel(recurOnceTime)}
+                      </p>
+                    </>
+                  ) : (
+                    <>
+                      <div className="fields-row">
+                        <label className="gateway-label">
+                          <span className="transfer-section-head">
+                            <span className="transfer-section-kicker">Category</span>
+                          </span>
+                          <select
+                            className="gateway-select"
+                            value={recurCategory}
+                            onChange={(e) => setRecurCategory(e.target.value)}
+                          >
+                            <option value="other">Settle later</option>
+                            {categoryOptions.map((item) => (
+                              <option key={item} value={item}>
+                                {item.charAt(0).toUpperCase() + item.slice(1)}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+
+                        <label className="gateway-label">
+                          <span className="transfer-section-head">
+                            <span className="transfer-section-kicker">Frequency</span>
+                          </span>
+                          <select
+                            className="gateway-select"
+                            value={recurFrequency}
+                            onChange={(e) => setRecurFrequency(e.target.value as RecurringFrequency)}
+                          >
+                            <option value="daily">Daily</option>
+                            <option value="weekly">Weekly</option>
+                            <option value="monthly">Monthly</option>
+                          </select>
+                        </label>
+
+                        <label className="gateway-label">
+                          <span className="transfer-section-head">
+                            <span className="transfer-section-kicker">Time</span>
+                          </span>
+                          <input
+                            type="time"
+                            className="gateway-select"
+                            value={recurTime}
+                            onChange={(e) => setRecurTime(e.target.value)}
+                          />
+                        </label>
+
+                        {recurFrequency === 'monthly' && (
+                          <label className="gateway-label">
+                            <span className="transfer-section-head">
+                              <span className="transfer-section-kicker">Day of month</span>
+                            </span>
+                            <select
+                              className="gateway-select"
+                              value={recurMonthDay}
+                              onChange={(e) => setRecurMonthDay(Number(e.target.value))}
+                            >
+                              {Array.from({ length: 31 }, (_, i) => i + 1).map((d) => (
+                                <option key={d} value={d}>
+                                  {ordinal(d)}
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+                        )}
+                      </div>
+
+                      {recurFrequency === 'weekly' && (
+                        <div className="recurring-weekday-picker">
+                          <span className="transfer-section-kicker">Day of week</span>
+                          <div className="recurring-weekday-options">
+                            {WEEKDAYS.map((d) => (
+                              <button
+                                key={d.value}
+                                type="button"
+                                className={`recurring-weekday-chip${recurWeekday === d.value ? ' recurring-weekday-chip-active' : ''}`}
+                                onClick={() => setRecurWeekday(d.value)}
+                              >
+                                {d.label}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      <p className="transfer-section-meta recurring-schedule-summary">
+                        {recurFrequency === 'daily' && `Debits every day at ${formatTimeLabel(recurTime)}`}
+                        {recurFrequency === 'weekly' &&
+                          `Debits every ${WEEKDAYS.find((d) => d.value === recurWeekday)?.full} at ${formatTimeLabel(recurTime)}`}
+                        {recurFrequency === 'monthly' &&
+                          `Debits every ${ordinal(recurMonthDay)} of the month at ${formatTimeLabel(recurTime)}`}
+                      </p>
+                    </>
+                  )}
                 </div>
               </>
             ) : (
@@ -1309,7 +1435,9 @@ export function TransferForm({
                     : qrPrefill
                       ? 'Pay via QR'
                       : mode === 'recurring'
-                        ? 'Set up recurring payment'
+                        ? recurScheduleType === 'once'
+                          ? 'Schedule payment'
+                          : 'Set up recurring payment'
                         : 'Move money'}
               </button>
             )}
@@ -1403,6 +1531,8 @@ export function TransferForm({
                           >
                             {recurringCancellingId === p.id ? 'Cancelling…' : 'Cancel'}
                           </button>
+                        ) : p.frequency === 'once' && p.lastStatus === 'completed' ? (
+                          <span className="status-badge status-completed">completed</span>
                         ) : (
                           <span className="status-badge status-failed">cancelled</span>
                         )}
