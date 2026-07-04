@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import type { Transaction } from '../../api'
 import { formatMoney } from '../../api'
 import { DirectionIcon } from './DirectionIcon'
@@ -33,10 +33,13 @@ function startOfWeekUtc(now: Date) {
   return start
 }
 
+const PAGE_SIZE = 30
+
 export function TransactionHistory({ transactions, currentUsername, loading }: Props) {
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('')
   const [dateFilter, setDateFilter] = useState<DateFilter>('')
   const [idSearch, setIdSearch] = useState('')
+  const [visibleCount, setVisibleCount] = useState(PAGE_SIZE)
 
   const filtered = useMemo(() => {
     let result = transactions
@@ -63,6 +66,16 @@ export function TransactionHistory({ transactions, currentUsername, loading }: P
 
     return result
   }, [transactions, statusFilter, dateFilter, idSearch])
+
+  // Filters narrow down a potentially large, unbounded transaction history —
+  // reset the reveal window each time so "load more" doesn't carry over a
+  // stale count from a previous, differently-filtered view.
+  useEffect(() => {
+    setVisibleCount(PAGE_SIZE)
+  }, [statusFilter, dateFilter, idSearch])
+
+  const visible = filtered.slice(0, visibleCount)
+  const hasMore = filtered.length > visible.length
 
   const hasActiveFilters = Boolean(statusFilter || dateFilter || idSearch)
 
@@ -129,7 +142,7 @@ export function TransactionHistory({ transactions, currentUsername, loading }: P
         <p className="muted tx-empty-state">No transactions match these filters.</p>
       ) : (
         <ul className="tx-list">
-          {filtered.map((tx) => {
+          {visible.map((tx) => {
             const { outgoing, label, username } = describe(tx, currentUsername)
             const failed = tx.status === 'failed'
             return (
@@ -162,6 +175,12 @@ export function TransactionHistory({ transactions, currentUsername, loading }: P
             )
           })}
         </ul>
+      )}
+
+      {hasMore && (
+        <button type="button" className="link-btn tx-load-more" onClick={() => setVisibleCount((n) => n + PAGE_SIZE)}>
+          Show {Math.min(PAGE_SIZE, filtered.length - visible.length)} more
+        </button>
       )}
     </section>
   )

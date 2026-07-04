@@ -501,7 +501,6 @@ export function TransferForm({
   useEffect(() => {
     if (mode !== 'recurring') return
     loadRecurringPayments()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mode])
 
   useEffect(() => {

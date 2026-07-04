@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { Account, Transaction } from '../../api'
-import { downloadTransactionsCsv, fetchTransactions, formatMoney, updateTransaction } from '../../api'
+import { downloadTransactionsCsv, fetchTransactionsPage, formatMoney, updateTransaction } from '../../api'
 import { DirectionIcon } from './DirectionIcon'
 
 interface Props {
@@ -80,8 +80,12 @@ const AMOUNT_PRESETS: Array<{ label: string; min: string; max: string }> = [
   { label: '₹5,000+', min: '5000', max: '' },
 ]
 
+const PAGE_SIZE = 50
+
 export function TransactionsPage({ accounts, categories, currentUsername, onBack }: Props) {
   const [transactions, setTransactions] = useState<Transaction[]>([])
+  const [total, setTotal] = useState(0)
+  const [page, setPage] = useState(0)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [exportingCsv, setExportingCsv] = useState(false)
@@ -136,14 +140,22 @@ export function TransactionsPage({ accounts, categories, currentUsername, onBack
     [search, category, accountId, dateFrom, dateTo, minAmount, maxAmount, direction, status, referenceId]
   )
 
+  // A filter change invalidates whatever page you were on (there's no
+  // guarantee page 2 still exists under the new filters), so jump back to
+  // the top of the paged results rather than fetching a now-meaningless offset.
+  useEffect(() => {
+    setPage(0)
+  }, [filters])
+
   useEffect(() => {
     let cancelled = false
     const handle = setTimeout(() => {
       setLoading(true)
-      fetchTransactions(filters)
-        .then((data) => {
+      fetchTransactionsPage({ ...filters, limit: PAGE_SIZE, offset: page * PAGE_SIZE })
+        .then(({ transactions: data, total: totalCount }) => {
           if (cancelled) return
           setTransactions(data)
+          setTotal(totalCount)
           setError(null)
         })
         .catch((err) => {
@@ -158,7 +170,7 @@ export function TransactionsPage({ accounts, categories, currentUsername, onBack
       cancelled = true
       clearTimeout(handle)
     }
-  }, [filters])
+  }, [filters, page])
 
   const clearFilters = () => {
     setSearch('')
@@ -402,7 +414,9 @@ export function TransactionsPage({ accounts, categories, currentUsername, onBack
             <span className="transfer-section-kicker">Results</span>
             <h2>Transaction History</h2>
           </div>
-          <span className="tx-panel-count">{transactions.length} records</span>
+          <span className="tx-panel-count">
+            {total === 0 ? '0 records' : `${page * PAGE_SIZE + 1}–${page * PAGE_SIZE + transactions.length} of ${total}`}
+          </span>
         </div>
 
         {error && <p className="form-error">{error}</p>}
@@ -495,6 +509,30 @@ export function TransactionsPage({ accounts, categories, currentUsername, onBack
                 </article>
               )
             })}
+          </div>
+        )}
+
+        {total > PAGE_SIZE && (
+          <div className="tx-pagination">
+            <button
+              type="button"
+              className="secondary-btn"
+              onClick={() => setPage((p) => Math.max(0, p - 1))}
+              disabled={page === 0 || loading}
+            >
+              Previous
+            </button>
+            <span className="muted">
+              Page {page + 1} of {Math.ceil(total / PAGE_SIZE)}
+            </span>
+            <button
+              type="button"
+              className="secondary-btn"
+              onClick={() => setPage((p) => p + 1)}
+              disabled={(page + 1) * PAGE_SIZE >= total || loading}
+            >
+              Next
+            </button>
           </div>
         )}
       </section>

@@ -1,20 +1,23 @@
-import Database from "better-sqlite3";
 import { randomInt, randomUUID } from "crypto";
-import fs from "fs";
-import path from "path";
+import { pool, dbGet, dbAll, dbRun, withTransaction } from "./db.js";
 
 export const BUDGET_CATEGORIES = ["food", "transport", "shopping", "bills"];
 const BUDGET_CATEGORY_NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9 _-]{0,31}$/;
+const SCHEMA_MIGRATION_LOCK_ID = 803724521;
+const schemaClient = await pool.connect();
 
-const dataDir = process.env.DATA_DIR || path.join(process.cwd(), "data");
-fs.mkdirSync(dataDir, { recursive: true });
+// A single reusable helper that produces the "2026-07-04T10:15:30.123Z"
+// timestamp shape used throughout the API and UI.
+try {
+  await schemaClient.query("SELECT pg_advisory_lock($1)", [SCHEMA_MIGRATION_LOCK_ID]);
 
-const db = new Database(path.join(dataDir, "finflow.db"));
-db.pragma("journal_mode = WAL");
-db.pragma("foreign_keys = ON");
-db.pragma("busy_timeout = 5000");
+  await schemaClient.query(`
+  CREATE OR REPLACE FUNCTION iso_now() RETURNS TEXT AS $$
+    SELECT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"');
+  $$ LANGUAGE SQL VOLATILE;
+`);
 
-db.exec(`
+  await schemaClient.query(`
   CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
     username TEXT NOT NULL UNIQUE,
@@ -22,7 +25,7 @@ db.exec(`
     password_hash TEXT NOT NULL,
     upi_pin_hash TEXT,
     name TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    created_at TEXT NOT NULL DEFAULT iso_now()
   );
 
   CREATE TABLE IF NOT EXISTS accounts (
@@ -30,7 +33,7 @@ db.exec(`
     user_id TEXT NOT NULL REFERENCES users(id),
     account_name TEXT NOT NULL,
     balance INTEGER NOT NULL DEFAULT 0 CHECK (balance >= 0),
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    created_at TEXT NOT NULL DEFAULT iso_now()
   );
 
   CREATE TABLE IF NOT EXISTS transactions (
@@ -43,7 +46,7 @@ db.exec(`
     amount INTEGER NOT NULL CHECK (amount > 0),
     status TEXT NOT NULL CHECK (status IN ('completed', 'failed')),
     failure_reason TEXT,
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    created_at TEXT NOT NULL DEFAULT iso_now()
   );
 
   CREATE TABLE IF NOT EXISTS budgets (
@@ -52,8 +55,8 @@ db.exec(`
     category TEXT NOT NULL,
     monthly_limit INTEGER NOT NULL CHECK (monthly_limit >= 0),
     threshold_percent INTEGER NOT NULL DEFAULT 80 CHECK (threshold_percent BETWEEN 1 AND 100),
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    created_at TEXT NOT NULL DEFAULT iso_now(),
+    updated_at TEXT NOT NULL DEFAULT iso_now(),
     UNIQUE(user_id, category)
   );
 
@@ -64,15 +67,15 @@ db.exec(`
   );
 
   CREATE TABLE IF NOT EXISTS transfer_attempts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     user_id TEXT NOT NULL REFERENCES users(id),
-    attempted_at INTEGER NOT NULL
+    attempted_at BIGINT NOT NULL
   );
 
   CREATE TABLE IF NOT EXISTS failed_pin_attempts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     user_id TEXT NOT NULL REFERENCES users(id),
-    attempted_at INTEGER NOT NULL
+    attempted_at BIGINT NOT NULL
   );
 
   CREATE INDEX IF NOT EXISTS idx_accounts_user ON accounts(user_id);
@@ -82,61 +85,47 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_budgets_user ON budgets(user_id);
   CREATE INDEX IF NOT EXISTS idx_transfer_attempts_user ON transfer_attempts(user_id, attempted_at);
   CREATE INDEX IF NOT EXISTS idx_failed_pin_attempts_user ON failed_pin_attempts(user_id, attempted_at);
+`);
+// The CHECK (balance >= 0) column constraint blocks overdrafts at the database
+// layer even if a bug or race reaches past the route/service validation.
 
-  CREATE TRIGGER IF NOT EXISTS accounts_balance_nonnegative_insert
-  BEFORE INSERT ON accounts
-  WHEN NEW.balance < 0
-  BEGIN
-    SELECT RAISE(ABORT, 'account balance cannot be negative');
-  END;
-
-  CREATE TRIGGER IF NOT EXISTS accounts_balance_nonnegative_update
-  BEFORE UPDATE OF balance ON accounts
-  WHEN NEW.balance < 0
-  BEGIN
-    SELECT RAISE(ABORT, 'account balance cannot be negative');
-  END;
+// Postgres supports "ADD COLUMN IF NOT EXISTS" natively, so these migration
+// statements are safe to repeat on every boot.
+  await schemaClient.query(`
+  ALTER TABLE users ADD COLUMN IF NOT EXISTS upi_pin_hash TEXT;
+  ALTER TABLE transactions ADD COLUMN IF NOT EXISTS category TEXT NOT NULL DEFAULT 'other';
+  ALTER TABLE transactions ADD COLUMN IF NOT EXISTS note TEXT;
+  ALTER TABLE transactions ADD COLUMN IF NOT EXISTS reference_number TEXT;
+  ALTER TABLE transactions ADD COLUMN IF NOT EXISTS is_auto_mandate INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE transactions ADD COLUMN IF NOT EXISTS is_qr_payment INTEGER NOT NULL DEFAULT 0;
+  CREATE INDEX IF NOT EXISTS idx_transactions_created_at ON transactions(created_at);
+  CREATE INDEX IF NOT EXISTS idx_transactions_category ON transactions(category);
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_transactions_reference_number ON transactions(reference_number);
 `);
 
-// Migration for databases created before the UPI PIN feature existed —
-// SQLite's CREATE TABLE IF NOT EXISTS above is a no-op on an already-created
-// table, so older rows need the column added on. Accounts from before this
-// migration have no PIN set and are blocked from transferring (PIN_NOT_SET)
-// until they set one via POST /api/auth/pin.
-const userColumns = db.prepare("PRAGMA table_info(users)").all().map((c) => c.name);
-if (!userColumns.includes("upi_pin_hash")) {
-  db.exec("ALTER TABLE users ADD COLUMN upi_pin_hash TEXT");
+// If a database was created/migrated before these tables used SERIAL, the
+// backing sequences can lag behind existing rows. Repair them on boot so the
+// next insert never reuses an id and trips a primary-key conflict.
+  await schemaClient.query(`
+  SELECT setval(pg_get_serial_sequence('transfer_attempts', 'id'), COALESCE((SELECT MAX(id) FROM transfer_attempts), 0) + 1, false);
+  SELECT setval(pg_get_serial_sequence('failed_pin_attempts', 'id'), COALESCE((SELECT MAX(id) FROM failed_pin_attempts), 0) + 1, false);
+`);
+} finally {
+  try {
+    await schemaClient.query("SELECT pg_advisory_unlock($1)", [SCHEMA_MIGRATION_LOCK_ID]);
+  } finally {
+    schemaClient.release();
+  }
 }
-
-const transactionColumns = db.prepare("PRAGMA table_info(transactions)").all().map((c) => c.name);
-if (!transactionColumns.includes("category")) {
-  db.exec("ALTER TABLE transactions ADD COLUMN category TEXT NOT NULL DEFAULT 'other'");
-}
-if (!transactionColumns.includes("note")) {
-  db.exec("ALTER TABLE transactions ADD COLUMN note TEXT");
-}
-if (!transactionColumns.includes("reference_number")) {
-  db.exec("ALTER TABLE transactions ADD COLUMN reference_number TEXT");
-}
-if (!transactionColumns.includes("is_auto_mandate")) {
-  db.exec("ALTER TABLE transactions ADD COLUMN is_auto_mandate INTEGER NOT NULL DEFAULT 0");
-}
-if (!transactionColumns.includes("is_qr_payment")) {
-  db.exec("ALTER TABLE transactions ADD COLUMN is_qr_payment INTEGER NOT NULL DEFAULT 0");
-}
-
-db.exec("CREATE INDEX IF NOT EXISTS idx_transactions_created_at ON transactions(created_at)");
-db.exec("CREATE INDEX IF NOT EXISTS idx_transactions_category ON transactions(category)");
-db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_transactions_reference_number ON transactions(reference_number)");
 
 // A short 6-digit reference number shown in the UI alongside every
 // transaction, distinct from the internal UUID `id`. Retries on the rare
 // collision against the unique index above.
-const checkReferenceNumberStmt = db.prepare("SELECT 1 FROM transactions WHERE reference_number = ?");
-export function generateReferenceNumber() {
+export async function generateReferenceNumber() {
   for (let attempt = 0; attempt < 10; attempt++) {
     const candidate = String(randomInt(100000, 1000000));
-    if (!checkReferenceNumberStmt.get(candidate)) return candidate;
+    const existing = await dbGet("SELECT 1 FROM transactions WHERE reference_number = ?", candidate);
+    if (!existing) return candidate;
   }
   throw new Error("Could not generate a unique transaction reference number");
 }
@@ -144,18 +133,18 @@ export function generateReferenceNumber() {
 // Backfill reference numbers for transactions that existed before this
 // column did — otherwise every pre-migration row would show a blank
 // reference in the UI forever.
-const legacyTransactionIds = db
-  .prepare("SELECT id FROM transactions WHERE reference_number IS NULL")
-  .all()
-  .map((row) => row.id);
-if (legacyTransactionIds.length > 0) {
-  const backfillReferenceNumberStmt = db.prepare("UPDATE transactions SET reference_number = @referenceNumber WHERE id = @id");
-  const backfillTxn = db.transaction((ids) => {
-    for (const id of ids) {
-      backfillReferenceNumberStmt.run({ id, referenceNumber: generateReferenceNumber() });
-    }
-  });
-  backfillTxn(legacyTransactionIds);
+{
+  const legacyTransactions = await dbAll("SELECT id FROM transactions WHERE reference_number IS NULL");
+  if (legacyTransactions.length > 0) {
+    await withTransaction(async (tx) => {
+      for (const row of legacyTransactions) {
+        await tx.run("UPDATE transactions SET reference_number = @referenceNumber WHERE id = @id", {
+          id: row.id,
+          referenceNumber: await generateReferenceNumber(),
+        });
+      }
+    });
+  }
 }
 
 // ---- row -> API JSON shape ----
@@ -235,112 +224,91 @@ const TRANSACTION_SELECT = `
 
 // ---- users ----
 
-const insertUserStmt = db.prepare(
-  "INSERT INTO users (id, username, email, password_hash, upi_pin_hash, name) VALUES (?, ?, ?, ?, ?, ?)"
-);
-const getUserByEmailStmt = db.prepare("SELECT * FROM users WHERE email = ?");
-const getUserByUsernameStmt = db.prepare("SELECT * FROM users WHERE username = ?");
-const getUserByIdStmt = db.prepare("SELECT * FROM users WHERE id = ?");
-const insertAccountStmt = db.prepare(
-  "INSERT INTO accounts (id, user_id, account_name, balance) VALUES (?, ?, ?, ?)"
-);
+const INSERT_USER_SQL = "INSERT INTO users (id, username, email, password_hash, upi_pin_hash, name) VALUES (?, ?, ?, ?, ?, ?)";
+const GET_USER_BY_EMAIL_SQL = "SELECT * FROM users WHERE email = ?";
+const GET_USER_BY_USERNAME_SQL = "SELECT * FROM users WHERE username = ?";
+const GET_USER_BY_ID_SQL = "SELECT * FROM users WHERE id = ?";
+const INSERT_ACCOUNT_SQL = "INSERT INTO accounts (id, user_id, account_name, balance) VALUES (?, ?, ?, ?)";
 
-export function findUserByEmail(email) {
-  return getUserByEmailStmt.get(email);
+export async function findUserByEmail(email) {
+  return dbGet(GET_USER_BY_EMAIL_SQL, email);
 }
 
-export function findUserByUsername(username) {
-  return getUserByUsernameStmt.get(username);
+export async function findUserByUsername(username) {
+  return dbGet(GET_USER_BY_USERNAME_SQL, username);
 }
 
-export function getUserById(id) {
-  return toUserJSON(getUserByIdStmt.get(id));
+export async function getUserById(id) {
+  return toUserJSON(await dbGet(GET_USER_BY_ID_SQL, id));
 }
 
-export function getUserRawById(id) {
-  return getUserByIdStmt.get(id);
+export async function getUserRawById(id) {
+  return dbGet(GET_USER_BY_ID_SQL, id);
 }
 
-const setUserPinStmt = db.prepare("UPDATE users SET upi_pin_hash = ? WHERE id = ?");
+const SET_USER_PIN_SQL = "UPDATE users SET upi_pin_hash = ? WHERE id = ?";
 
-export function setUserPin(userId, upiPinHash) {
-  setUserPinStmt.run(upiPinHash, userId);
-}
-
-// Signup now collects a PIN up front, but accounts created before that
-// change have no PIN set at all and would otherwise be locked out of every
-// PIN-gated action. Takes the hashing function as a parameter instead of
-// importing services/auth.js directly, since that module already imports
-// from here (would otherwise be a circular import).
-export function backfillMissingPins(hashPin, defaultPin) {
-  const rows = db.prepare("SELECT id FROM users WHERE upi_pin_hash IS NULL").all();
-  if (rows.length === 0) return 0;
-  const hash = hashPin(defaultPin);
-  const txn = db.transaction((ids) => {
-    for (const id of ids) setUserPinStmt.run(hash, id);
-  });
-  txn(rows.map((r) => r.id));
-  return rows.length;
+export async function setUserPin(userId, upiPinHash) {
+  await dbRun(SET_USER_PIN_SQL, upiPinHash, userId);
 }
 
 // Includes the requesting user in results (labeled by the caller) so
 // transfers between your own accounts stay reachable through the same
 // username-search flow used for sending to other people.
-export function searchUsers(query, requestingUserId) {
+export async function searchUsers(query, requestingUserId) {
   const like = `%${query}%`;
-  return db
-    .prepare(
-      `SELECT id, username, name, email FROM users
-       WHERE id != ? AND (username LIKE ? OR name LIKE ? OR email LIKE ?)
-       ORDER BY (CASE WHEN username LIKE ? THEN 0 ELSE 1 END), username ASC
-       LIMIT 8`
-    )
-    .all(requestingUserId, like, like, like, `${query}%`);
+  return dbAll(
+    `SELECT id, username, name, email FROM users
+     WHERE id != ? AND (username LIKE ? OR name LIKE ? OR email LIKE ?)
+     ORDER BY (CASE WHEN username LIKE ? THEN 0 ELSE 1 END), username ASC
+     LIMIT 8`,
+    requestingUserId,
+    like,
+    like,
+    like,
+    `${query}%`
+  );
 }
 
 // Creates the user and seeds two starter accounts (Checking/Savings) in one
 // atomic transaction, so a crash mid-signup never leaves a user with no accounts.
-const createUserTxn = db.transaction(({ id, username, email, passwordHash, upiPinHash, name }) => {
-  insertUserStmt.run(id, username, email, passwordHash, upiPinHash, name);
-  insertAccountStmt.run(randomUUID(), id, "Checking", 100000);
-  insertAccountStmt.run(randomUUID(), id, "Savings", 50000);
-  return getUserByIdStmt.get(id);
-});
-
-export function createUser({ username, email, passwordHash, upiPinHash, name }) {
-  const user = createUserTxn({ id: randomUUID(), username, email, passwordHash, upiPinHash, name });
+export async function createUser({ username, email, passwordHash, upiPinHash, name }) {
+  const id = randomUUID();
+  const user = await withTransaction(async (tx) => {
+    await tx.run(INSERT_USER_SQL, id, username, email, passwordHash, upiPinHash, name);
+    await tx.run(INSERT_ACCOUNT_SQL, randomUUID(), id, "Checking", 100000);
+    await tx.run(INSERT_ACCOUNT_SQL, randomUUID(), id, "Savings", 50000);
+    return tx.get(GET_USER_BY_ID_SQL, id);
+  });
   return toUserJSON(user);
 }
 
 // ---- accounts ----
 
-const getAccountRawStmt = db.prepare("SELECT * FROM accounts WHERE id = ?");
-const listAccountsByUserStmt = db.prepare(
-  "SELECT * FROM accounts WHERE user_id = ? ORDER BY created_at ASC"
-);
+const GET_ACCOUNT_RAW_SQL = "SELECT * FROM accounts WHERE id = ?";
+const LIST_ACCOUNTS_BY_USER_SQL = `
+  SELECT * FROM accounts
+  WHERE user_id = ?
+  ORDER BY created_at ASC, account_name ASC, id ASC
+`;
 
-const pruneTransferAttemptsStmt = db.prepare("DELETE FROM transfer_attempts WHERE user_id = @userId AND attempted_at < @cutoff");
-const countTransferAttemptsStmt = db.prepare(
-  "SELECT COUNT(*) AS count FROM transfer_attempts WHERE user_id = @userId AND attempted_at >= @cutoff"
-);
-const insertTransferAttemptStmt = db.prepare("INSERT INTO transfer_attempts (user_id, attempted_at) VALUES (@userId, @now)");
-
-// Backed by SQLite (not an in-memory Map) so the limit survives a server
-// restart and stays correct if this ever runs as more than one instance
-// sharing the same database file — an in-process counter would silently
-// reset or under-count in either case.
-const recordTransferAttemptTxn = db.transaction((userId, windowMs, maxCount) => {
-  const now = Date.now();
-  const cutoff = now - windowMs;
-  pruneTransferAttemptsStmt.run({ userId, cutoff });
-  const { count } = countTransferAttemptsStmt.get({ userId, cutoff });
-  if (count >= maxCount) return false;
-  insertTransferAttemptStmt.run({ userId, now });
-  return true;
-});
-
-export function checkTransferRateLimit(userId, windowMs, maxCount) {
-  return recordTransferAttemptTxn(userId, windowMs, maxCount);
+// Backed by Postgres (not an in-memory Map) so the limit survives a server
+// restart and stays correct across multiple backend instances sharing the
+// same database — an in-process counter would silently reset or under-count
+// in either case.
+export async function checkTransferRateLimit(userId, windowMs, maxCount) {
+  return withTransaction(async (tx) => {
+    const now = Date.now();
+    const cutoff = now - windowMs;
+    await tx.run("DELETE FROM transfer_attempts WHERE user_id = @userId AND attempted_at < @cutoff", { userId, cutoff });
+    const { count } = await tx.get(
+      "SELECT COUNT(*) AS count FROM transfer_attempts WHERE user_id = @userId AND attempted_at >= @cutoff",
+      { userId, cutoff }
+    );
+    if (Number(count) >= maxCount) return false;
+    await tx.run("INSERT INTO transfer_attempts (user_id, attempted_at) VALUES (@userId, @now)", { userId, now });
+    return true;
+  });
 }
 
 // ---- PIN lockout ----
@@ -348,22 +316,17 @@ export function checkTransferRateLimit(userId, windowMs, maxCount) {
 // balance reveal, recurring setup) is recorded here; a correct PIN clears the
 // whole streak. checkPinAuthorization (services/auth.js) is what actually
 // decides when this adds up to a lockout.
-const insertFailedPinAttemptStmt = db.prepare("INSERT INTO failed_pin_attempts (user_id, attempted_at) VALUES (?, ?)");
-const listFailedPinAttemptsStmt = db.prepare(
-  "SELECT attempted_at FROM failed_pin_attempts WHERE user_id = ? ORDER BY attempted_at DESC"
-);
-const clearFailedPinAttemptsStmt = db.prepare("DELETE FROM failed_pin_attempts WHERE user_id = ?");
-
-export function recordFailedPinAttempt(userId) {
-  insertFailedPinAttemptStmt.run(userId, Date.now());
+export async function recordFailedPinAttempt(userId) {
+  await dbRun("INSERT INTO failed_pin_attempts (user_id, attempted_at) VALUES (?, ?)", userId, Date.now());
 }
 
-export function listFailedPinAttempts(userId) {
-  return listFailedPinAttemptsStmt.all(userId).map((row) => row.attempted_at);
+export async function listFailedPinAttempts(userId) {
+  const rows = await dbAll("SELECT attempted_at FROM failed_pin_attempts WHERE user_id = ? ORDER BY attempted_at DESC", userId);
+  return rows.map((row) => Number(row.attempted_at));
 }
 
-export function clearFailedPinAttempts(userId) {
-  clearFailedPinAttemptsStmt.run(userId);
+export async function clearFailedPinAttempts(userId) {
+  await dbRun("DELETE FROM failed_pin_attempts WHERE user_id = ?", userId);
 }
 
 export function isValidBudgetCategoryName(category) {
@@ -375,161 +338,48 @@ export function normalizeBudgetCategory(category) {
   return category.trim().toLowerCase().replace(/\s+/g, " ");
 }
 
-const listDeletedPresetsStmt = db.prepare("SELECT category FROM budget_deleted_presets WHERE user_id = ?");
-
-export function listBudgetCategories(userId) {
+export async function listBudgetCategories(userId) {
   if (!userId) return [...BUDGET_CATEGORIES];
-  const deletedPresets = new Set(listDeletedPresetsStmt.all(userId).map((row) => row.category));
+  const deletedRows = await dbAll("SELECT category FROM budget_deleted_presets WHERE user_id = ?", userId);
+  const deletedPresets = new Set(deletedRows.map((row) => row.category));
   const activePresets = BUDGET_CATEGORIES.filter((category) => !deletedPresets.has(category));
-  const customCategories = db
-    .prepare("SELECT DISTINCT category FROM budgets WHERE user_id = ? ORDER BY category ASC")
-    .all(userId)
-    .map((row) => row.category)
-    .filter((category) => !BUDGET_CATEGORIES.includes(category));
+  const customRows = await dbAll("SELECT DISTINCT category FROM budgets WHERE user_id = ? ORDER BY category ASC", userId);
+  const customCategories = customRows.map((row) => row.category).filter((category) => !BUDGET_CATEGORIES.includes(category));
   return [...activePresets, ...customCategories];
 }
 
-export function listAccounts(userId) {
-  return listAccountsByUserStmt.all(userId).map(toAccountJSON);
+export async function listAccounts(userId) {
+  const rows = await dbAll(LIST_ACCOUNTS_BY_USER_SQL, userId);
+  return rows.map(toAccountJSON);
 }
 
-export function createAccount({ userId, accountName, balance = 0 }) {
+export async function createAccount({ userId, accountName, balance = 0 }) {
   const id = randomUUID();
-  insertAccountStmt.run(id, userId, accountName, balance);
-  return toAccountJSON(getAccountRawStmt.get(id));
+  await dbRun(INSERT_ACCOUNT_SQL, id, userId, accountName, balance);
+  return toAccountJSON(await dbGet(GET_ACCOUNT_RAW_SQL, id));
 }
 
-export function getAccount(id, userId) {
-  const row = getAccountRawStmt.get(id);
+export async function getAccount(id, userId) {
+  const row = await dbGet(GET_ACCOUNT_RAW_SQL, id);
   if (!row || row.user_id !== userId) return null;
   return toAccountJSON(row);
 }
 
-export function listBudgets(userId) {
-  return listBudgetRowsStmt.all(userId).map(toBudgetJSON);
-}
-
-const deleteDeletedPresetStmt = db.prepare(
-  "DELETE FROM budget_deleted_presets WHERE user_id = ? AND category = ?"
-);
-
-export function upsertBudgets(userId, budgets) {
-  const txn = db.transaction((items) => {
-    for (const budget of items) {
-      const normalizedCategory = normalizeBudgetCategory(budget.category);
-      upsertBudgetStmt.run({
-        id: randomUUID(),
-        userId,
-        category: normalizedCategory,
-        monthlyLimit: budget.monthlyLimit,
-        thresholdPercent: budget.thresholdPercent ?? 80,
-      });
-      deleteDeletedPresetStmt.run(userId, normalizedCategory);
-    }
-  });
-
-  txn(budgets);
-  return listBudgets(userId);
-}
-
-const updateTransactionCategoryStmt = db.prepare(
-  "UPDATE transactions SET category = @category WHERE id = @id AND initiated_by_user_id = @userId"
-);
-const updateTransactionNoteStmt = db.prepare(
-  "UPDATE transactions SET note = @note WHERE id = @id AND initiated_by_user_id = @userId"
-);
-const updateTransactionCategoryAndNoteStmt = db.prepare(
-  "UPDATE transactions SET category = @category, note = @note WHERE id = @id AND initiated_by_user_id = @userId"
-);
-
-export function updateTransactionCategory(userId, transactionId, category) {
-  const normalizedCategory = normalizeBudgetCategory(category);
-  const result = updateTransactionCategoryStmt.run({ id: transactionId, userId, category: normalizedCategory });
-  if (result.changes === 0) return null;
-  return getTransaction(transactionId, userId);
-}
-
-// Edits a transaction's category and/or note (a free-text description you can
-// attach after the fact — useful for "other" spends or just annotating what
-// something was for). Either field can be omitted to leave it unchanged.
-export function updateTransaction(userId, transactionId, { category, note }) {
-  const hasCategory = category !== undefined;
-  const hasNote = note !== undefined;
-  const normalizedNote = hasNote ? (typeof note === "string" && note.trim() ? note.trim().slice(0, 280) : null) : undefined;
-
-  let result;
-  if (hasCategory && hasNote) {
-    result = updateTransactionCategoryAndNoteStmt.run({
-      id: transactionId,
-      userId,
-      category: normalizeBudgetCategory(category),
-      note: normalizedNote,
-    });
-  } else if (hasCategory) {
-    result = updateTransactionCategoryStmt.run({ id: transactionId, userId, category: normalizeBudgetCategory(category) });
-  } else if (hasNote) {
-    result = updateTransactionNoteStmt.run({ id: transactionId, userId, note: normalizedNote });
-  } else {
-    return getTransaction(transactionId, userId);
-  }
-
-  if (result.changes === 0) return null;
-  return getTransaction(transactionId, userId);
-}
-
-const reassignOrphanedTransactionsStmt = db.prepare(
-  "UPDATE transactions SET category = 'other' WHERE initiated_by_user_id = ? AND category = ?"
-);
-
-const insertDeletedPresetStmt = db.prepare(
-  "INSERT OR IGNORE INTO budget_deleted_presets (user_id, category) VALUES (?, ?)"
-);
-
-export function deleteBudgetCategory(userId, category) {
-  const normalizedCategory = normalizeBudgetCategory(category);
-  const isPreset = BUDGET_CATEGORIES.includes(normalizedCategory);
-  const txn = db.transaction(() => {
-    const result = db
-      .prepare("DELETE FROM budgets WHERE user_id = ? AND category = ?")
-      .run(userId, normalizedCategory);
-    if (result.changes > 0 && normalizedCategory !== "other") {
-      reassignOrphanedTransactionsStmt.run(userId, normalizedCategory);
-    }
-    // Presets are otherwise hardcoded into every user's category list, so
-    // deleting one only sticks if we also remember it was explicitly removed.
-    if (isPreset) {
-      insertDeletedPresetStmt.run(userId, normalizedCategory);
-    }
-    return result.changes > 0 || isPreset;
-  });
-  return txn();
-}
-
-// ---- transactions / transfers ----
-
-const debitAccountStmt = db.prepare(
-  "UPDATE accounts SET balance = balance - @amount WHERE id = @accountId AND balance >= @amount"
-);
-const creditAccountStmt = db.prepare(
-  "UPDATE accounts SET balance = balance + @amount WHERE id = @accountId"
-);
-const insertTransactionStmt = db.prepare(`
-  INSERT INTO transactions (id, reference_number, initiated_by_user_id, idempotency_key, from_account_id, to_account_id, category, amount, status, failure_reason, note, is_auto_mandate, is_qr_payment)
-  VALUES (@id, @referenceNumber, @userId, @idempotencyKey, @fromAccountId, @toAccountId, @category, @amount, @status, @failureReason, @note, @isAutoMandate, @isQrPayment)
-`);
-const getTransactionRawStmt = db.prepare(`${TRANSACTION_SELECT} WHERE t.id = ?`);
-const getTransactionByIdempotencyKeyStmt = db.prepare(
-  `${TRANSACTION_SELECT} WHERE t.idempotency_key = ? AND t.initiated_by_user_id = ?`
-);
-const listBudgetRowsStmt = db.prepare(`
+// Month boundaries are computed in IST (Asia/Kolkata, fixed UTC+5:30, no
+// DST) so budgets reset at local midnight on the 1st, then converted back to
+// UTC ISO strings to compare against created_at (stored in UTC).
+const LIST_BUDGET_ROWS_SQL = `
   WITH month_bounds AS (
-    -- Month boundaries are computed in IST (UTC+5:30): shift 'now' into IST
-    -- wall-clock numberspace, snap to the start of that month, then shift back
-    -- to true UTC so the bounds compare correctly against created_at (UTC).
     SELECT
-      strftime('%Y-%m', 'now', '+5 hours', '+30 minutes') AS month_key,
-      strftime('%Y-%m-%dT%H:%M:%S.000Z', 'now', '+5 hours', '+30 minutes', 'start of month', '-5 hours', '-30 minutes') AS month_start,
-      strftime('%Y-%m-%dT%H:%M:%S.000Z', 'now', '+5 hours', '+30 minutes', 'start of month', '+1 month', '-5 hours', '-30 minutes') AS month_end
+      to_char(now() AT TIME ZONE 'Asia/Kolkata', 'YYYY-MM') AS month_key,
+      to_char(
+        (date_trunc('month', now() AT TIME ZONE 'Asia/Kolkata') AT TIME ZONE 'Asia/Kolkata') AT TIME ZONE 'UTC',
+        'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
+      ) AS month_start,
+      to_char(
+        ((date_trunc('month', now() AT TIME ZONE 'Asia/Kolkata') + INTERVAL '1 month') AT TIME ZONE 'Asia/Kolkata') AT TIME ZONE 'UTC',
+        'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
+      ) AS month_end
   )
   SELECT
     b.*,
@@ -552,17 +402,111 @@ const listBudgetRowsStmt = db.prepare(`
   LEFT JOIN accounts fa ON fa.id = t.from_account_id
   LEFT JOIN accounts ta ON ta.id = t.to_account_id
   WHERE b.user_id = ?
-  GROUP BY b.id
+  GROUP BY b.id, mb.month_key
   ORDER BY b.category ASC
-`);
-const upsertBudgetStmt = db.prepare(`
+`;
+const UPSERT_BUDGET_SQL = `
   INSERT INTO budgets (id, user_id, category, monthly_limit, threshold_percent)
   VALUES (@id, @userId, @category, @monthlyLimit, @thresholdPercent)
   ON CONFLICT(user_id, category) DO UPDATE SET
     monthly_limit = excluded.monthly_limit,
     threshold_percent = excluded.threshold_percent,
-    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-`);
+    updated_at = iso_now()
+`;
+
+export async function listBudgets(userId) {
+  const rows = await dbAll(LIST_BUDGET_ROWS_SQL, userId);
+  return rows.map((row) => toBudgetJSON({ ...row, spent: Number(row.spent) }));
+}
+
+export async function upsertBudgets(userId, budgets) {
+  await withTransaction(async (tx) => {
+    for (const budget of budgets) {
+      const normalizedCategory = normalizeBudgetCategory(budget.category);
+      await tx.run(UPSERT_BUDGET_SQL, {
+        id: randomUUID(),
+        userId,
+        category: normalizedCategory,
+        monthlyLimit: budget.monthlyLimit,
+        thresholdPercent: budget.thresholdPercent ?? 80,
+      });
+      await tx.run("DELETE FROM budget_deleted_presets WHERE user_id = ? AND category = ?", userId, normalizedCategory);
+    }
+  });
+  return listBudgets(userId);
+}
+
+const UPDATE_TRANSACTION_CATEGORY_SQL = "UPDATE transactions SET category = @category WHERE id = @id AND initiated_by_user_id = @userId";
+const UPDATE_TRANSACTION_NOTE_SQL = "UPDATE transactions SET note = @note WHERE id = @id AND initiated_by_user_id = @userId";
+const UPDATE_TRANSACTION_CATEGORY_AND_NOTE_SQL =
+  "UPDATE transactions SET category = @category, note = @note WHERE id = @id AND initiated_by_user_id = @userId";
+
+export async function updateTransactionCategory(userId, transactionId, category) {
+  const normalizedCategory = normalizeBudgetCategory(category);
+  const result = await dbRun(UPDATE_TRANSACTION_CATEGORY_SQL, { id: transactionId, userId, category: normalizedCategory });
+  if (result.changes === 0) return null;
+  return getTransaction(transactionId, userId);
+}
+
+// Edits a transaction's category and/or note (a free-text description you can
+// attach after the fact — useful for "other" spends or just annotating what
+// something was for). Either field can be omitted to leave it unchanged.
+export async function updateTransaction(userId, transactionId, { category, note }) {
+  const hasCategory = category !== undefined;
+  const hasNote = note !== undefined;
+  const normalizedNote = hasNote ? (typeof note === "string" && note.trim() ? note.trim().slice(0, 280) : null) : undefined;
+
+  let result;
+  if (hasCategory && hasNote) {
+    result = await dbRun(UPDATE_TRANSACTION_CATEGORY_AND_NOTE_SQL, {
+      id: transactionId,
+      userId,
+      category: normalizeBudgetCategory(category),
+      note: normalizedNote,
+    });
+  } else if (hasCategory) {
+    result = await dbRun(UPDATE_TRANSACTION_CATEGORY_SQL, { id: transactionId, userId, category: normalizeBudgetCategory(category) });
+  } else if (hasNote) {
+    result = await dbRun(UPDATE_TRANSACTION_NOTE_SQL, { id: transactionId, userId, note: normalizedNote });
+  } else {
+    return getTransaction(transactionId, userId);
+  }
+
+  if (result.changes === 0) return null;
+  return getTransaction(transactionId, userId);
+}
+
+export async function deleteBudgetCategory(userId, category) {
+  const normalizedCategory = normalizeBudgetCategory(category);
+  const isPreset = BUDGET_CATEGORIES.includes(normalizedCategory);
+  return withTransaction(async (tx) => {
+    const result = await tx.run("DELETE FROM budgets WHERE user_id = ? AND category = ?", userId, normalizedCategory);
+    if (result.changes > 0 && normalizedCategory !== "other") {
+      await tx.run("UPDATE transactions SET category = 'other' WHERE initiated_by_user_id = ? AND category = ?", userId, normalizedCategory);
+    }
+    // Presets are otherwise hardcoded into every user's category list, so
+    // deleting one only sticks if we also remember it was explicitly removed.
+    if (isPreset) {
+      await tx.run(
+        "INSERT INTO budget_deleted_presets (user_id, category) VALUES (?, ?) ON CONFLICT (user_id, category) DO NOTHING",
+        userId,
+        normalizedCategory
+      );
+    }
+    return result.changes > 0 || isPreset;
+  });
+}
+
+// ---- transactions / transfers ----
+
+const DEBIT_ACCOUNT_SQL = "UPDATE accounts SET balance = balance - @amount WHERE id = @accountId AND balance >= @amount";
+const CREDIT_ACCOUNT_SQL = "UPDATE accounts SET balance = balance + @amount WHERE id = @accountId";
+const INSERT_TRANSACTION_SQL = `
+  INSERT INTO transactions (id, reference_number, initiated_by_user_id, idempotency_key, from_account_id, to_account_id, category, amount, status, failure_reason, note, is_auto_mandate, is_qr_payment)
+  VALUES (@id, @referenceNumber, @userId, @idempotencyKey, @fromAccountId, @toAccountId, @category, @amount, @status, @failureReason, @note, @isAutoMandate, @isQrPayment)
+`;
+const GET_TRANSACTION_RAW_SQL = `${TRANSACTION_SELECT} WHERE t.id = ?`;
+const GET_TRANSACTION_BY_IDEMPOTENCY_KEY_SQL = `${TRANSACTION_SELECT} WHERE t.idempotency_key = ? AND t.initiated_by_user_id = ?`;
 
 class TransferError extends Error {
   constructor(status, code, message, transaction = null) {
@@ -574,12 +518,7 @@ class TransferError extends Error {
 }
 
 function insufficientFundsError(transaction) {
-  return new TransferError(
-    422,
-    "INSUFFICIENT_FUNDS",
-    "Source account has insufficient funds",
-    toTransactionJSON(transaction)
-  );
+  return new TransferError(422, "INSUFFICIENT_FUNDS", "Source account has insufficient funds", toTransactionJSON(transaction));
 }
 
 function assertSameIdempotentTransfer(existing, { fromAccountId, toUsername, amount, category }) {
@@ -589,11 +528,7 @@ function assertSameIdempotentTransfer(existing, { fromAccountId, toUsername, amo
     existing.amount !== amount ||
     existing.category !== category
   ) {
-    throw new TransferError(
-      409,
-      "IDEMPOTENCY_KEY_REUSED",
-      "This idempotency key has already been used for a different transfer"
-    );
+    throw new TransferError(409, "IDEMPOTENCY_KEY_REUSED", "This idempotency key has already been used for a different transfer");
   }
 }
 
@@ -601,81 +536,75 @@ function assertSameIdempotentTransfer(existing, { fromAccountId, toUsername, amo
 // Transfers to another person land in their primary (earliest-created) account.
 // A "transfer to yourself" resolves to any other account you own, since you
 // can't send money into the same account you're sending it from.
-function resolveDestinationAccountId(userId, fromAccountId, toUsername) {
-  const recipient = getUserByUsernameStmt.get(toUsername);
+async function resolveDestinationAccountId(tx, userId, fromAccountId, toUsername) {
+  const recipient = await tx.get(GET_USER_BY_USERNAME_SQL, toUsername);
   if (!recipient) {
     throw new TransferError(404, "RECIPIENT_NOT_FOUND", `No user found with username "${toUsername}"`);
   }
-  const recipientAccounts = listAccountsByUserStmt.all(recipient.id);
   if (recipient.id === userId) {
     throw new TransferError(400, "SELF_TRANSFER_BLOCKED", "Transfers to your own username are not allowed");
   }
+  const recipientAccounts = await tx.all(LIST_ACCOUNTS_BY_USER_SQL, recipient.id);
   if (recipientAccounts.length === 0) {
     throw new TransferError(404, "RECIPIENT_NOT_FOUND", `${toUsername} has no accounts to receive funds`);
   }
   return recipientAccounts[0].id;
 }
 
-// Runs as a single SQLite transaction: resolves the recipient, validates
+// Runs as a single Postgres transaction: resolves the recipient, validates
 // ownership and funds, and applies the debit/credit atomically so a crash or
 // concurrent request can never leave balances or history in a partial state.
 // A failed (insufficient-funds) attempt still commits as a history row — only
 // throwing here would roll back that audit record along with everything else.
-const transferTxn = db.transaction(
-  ({ id, userId, idempotencyKey, fromAccountId, toUsername, amount, category, note, isAutoMandate, isQrPayment }) => {
-    const referenceNumber = generateReferenceNumber();
-    const from = getAccountRawStmt.get(fromAccountId);
+// The conditional `WHERE balance >= @amount` on the debit (not just the CHECK
+// constraint) is what actually prevents a race between two concurrent debits
+// on the same account: Postgres row-locks the account row on UPDATE, so a
+// second concurrent debit blocks until the first commits, then re-evaluates
+// this WHERE clause against the now-updated balance.
+async function transferTxn({ id, userId, idempotencyKey, fromAccountId, toUsername, amount, category, note, isAutoMandate, isQrPayment }) {
+  return withTransaction(async (tx) => {
+    const referenceNumber = await generateReferenceNumber();
+    const from = await tx.get(GET_ACCOUNT_RAW_SQL, fromAccountId);
     if (!from || from.user_id !== userId) {
       throw new TransferError(404, "ACCOUNT_NOT_FOUND", `Account ${fromAccountId} not found`);
     }
 
-    const toAccountId = resolveDestinationAccountId(userId, fromAccountId, toUsername);
+    const toAccountId = await resolveDestinationAccountId(tx, userId, fromAccountId, toUsername);
+
+    const insertFailed = () =>
+      tx.run(INSERT_TRANSACTION_SQL, {
+        id,
+        referenceNumber,
+        userId,
+        idempotencyKey: idempotencyKey ?? null,
+        fromAccountId,
+        toAccountId,
+        category,
+        amount,
+        status: "failed",
+        failureReason: "insufficient_funds",
+        note,
+        isAutoMandate: isAutoMandate ? 1 : 0,
+        isQrPayment: isQrPayment ? 1 : 0,
+      });
 
     if (from.balance < amount) {
-      insertTransactionStmt.run({
-        id,
-        referenceNumber,
-        userId,
-        idempotencyKey: idempotencyKey ?? null,
-        fromAccountId,
-        toAccountId,
-        category,
-        amount,
-        status: "failed",
-        failureReason: "insufficient_funds",
-        note,
-        isAutoMandate: isAutoMandate ? 1 : 0,
-        isQrPayment: isQrPayment ? 1 : 0,
-      });
-      return getTransactionRawStmt.get(id);
+      await insertFailed();
+      return tx.get(GET_TRANSACTION_RAW_SQL, id);
     }
 
-    const debit = debitAccountStmt.run({ amount, accountId: fromAccountId });
+    const debit = await tx.run(DEBIT_ACCOUNT_SQL, { amount, accountId: fromAccountId });
     if (debit.changes !== 1) {
-      insertTransactionStmt.run({
-        id,
-        referenceNumber,
-        userId,
-        idempotencyKey: idempotencyKey ?? null,
-        fromAccountId,
-        toAccountId,
-        category,
-        amount,
-        status: "failed",
-        failureReason: "insufficient_funds",
-        note,
-        isAutoMandate: isAutoMandate ? 1 : 0,
-        isQrPayment: isQrPayment ? 1 : 0,
-      });
-      return getTransactionRawStmt.get(id);
+      await insertFailed();
+      return tx.get(GET_TRANSACTION_RAW_SQL, id);
     }
 
-    const credit = creditAccountStmt.run({ amount, accountId: toAccountId });
+    const credit = await tx.run(CREDIT_ACCOUNT_SQL, { amount, accountId: toAccountId });
     if (credit.changes !== 1) {
       throw new TransferError(404, "RECIPIENT_NOT_FOUND", "Recipient account is no longer available");
     }
 
-    insertTransactionStmt.run({
+    await tx.run(INSERT_TRANSACTION_SQL, {
       id,
       referenceNumber,
       userId,
@@ -691,11 +620,11 @@ const transferTxn = db.transaction(
       isQrPayment: isQrPayment ? 1 : 0,
     });
 
-    return getTransactionRawStmt.get(id);
-  }
-);
+    return tx.get(GET_TRANSACTION_RAW_SQL, id);
+  });
+}
 
-export function transfer({ userId, fromAccountId, toUsername, amount, idempotencyKey, category, note, isAutoMandate, isQrPayment }) {
+export async function transfer({ userId, fromAccountId, toUsername, amount, idempotencyKey, category, note, isAutoMandate, isQrPayment }) {
   if (!Number.isSafeInteger(amount) || amount <= 0) {
     throw new TransferError(400, "INVALID_AMOUNT", "amount must be a positive integer (cents)");
   }
@@ -708,7 +637,7 @@ export function transfer({ userId, fromAccountId, toUsername, amount, idempotenc
   const normalizedNote = typeof note === "string" && note.trim() ? note.trim().slice(0, 280) : null;
 
   if (idempotencyKey) {
-    const existing = getTransactionByIdempotencyKeyStmt.get(idempotencyKey, userId);
+    const existing = await dbGet(GET_TRANSACTION_BY_IDEMPOTENCY_KEY_SQL, idempotencyKey, userId);
     if (existing) {
       assertSameIdempotentTransfer(existing, {
         fromAccountId,
@@ -722,7 +651,7 @@ export function transfer({ userId, fromAccountId, toUsername, amount, idempotenc
   }
 
   try {
-    const transaction = transferTxn({
+    const transaction = await transferTxn({
       id: randomUUID(),
       userId,
       idempotencyKey,
@@ -740,8 +669,11 @@ export function transfer({ userId, fromAccountId, toUsername, amount, idempotenc
     return { transaction: toTransactionJSON(transaction), replayed: false };
   } catch (err) {
     if (err instanceof TransferError) throw err;
-    if (err.code === "SQLITE_CONSTRAINT_UNIQUE") {
-      const existing = getTransactionByIdempotencyKeyStmt.get(idempotencyKey, userId);
+    // Postgres's unique_violation code — the race this catches is two
+    // concurrent requests with the same idempotency key both missing the
+    // pre-check above and racing to insert; the loser lands here instead.
+    if (err.code === "23505") {
+      const existing = await dbGet(GET_TRANSACTION_BY_IDEMPOTENCY_KEY_SQL, idempotencyKey, userId);
       if (existing) {
         assertSameIdempotentTransfer(existing, {
           fromAccountId,
@@ -763,19 +695,49 @@ export function transfer({ userId, fromAccountId, toUsername, amount, idempotenc
 // user's own accounts) — so internal moves never distort a budget.
 const OWN_ACCOUNT_TRANSFER_CATEGORY = "transfer";
 
-const ownAccountTransferTxn = db.transaction(({ id, userId, idempotencyKey, fromAccountId, toAccountId, amount, note }) => {
-  const referenceNumber = generateReferenceNumber();
-  const from = getAccountRawStmt.get(fromAccountId);
-  if (!from || from.user_id !== userId) {
-    throw new TransferError(404, "ACCOUNT_NOT_FOUND", `Account ${fromAccountId} not found`);
-  }
-  const to = getAccountRawStmt.get(toAccountId);
-  if (!to || to.user_id !== userId) {
-    throw new TransferError(404, "ACCOUNT_NOT_FOUND", `Account ${toAccountId} not found`);
-  }
+async function ownAccountTransferTxn({ id, userId, idempotencyKey, fromAccountId, toAccountId, amount, note }) {
+  return withTransaction(async (tx) => {
+    const referenceNumber = await generateReferenceNumber();
+    const from = await tx.get(GET_ACCOUNT_RAW_SQL, fromAccountId);
+    if (!from || from.user_id !== userId) {
+      throw new TransferError(404, "ACCOUNT_NOT_FOUND", `Account ${fromAccountId} not found`);
+    }
+    const to = await tx.get(GET_ACCOUNT_RAW_SQL, toAccountId);
+    if (!to || to.user_id !== userId) {
+      throw new TransferError(404, "ACCOUNT_NOT_FOUND", `Account ${toAccountId} not found`);
+    }
 
-  if (from.balance < amount) {
-    insertTransactionStmt.run({
+    const insertFailed = () =>
+      tx.run(INSERT_TRANSACTION_SQL, {
+        id,
+        referenceNumber,
+        userId,
+        idempotencyKey: idempotencyKey ?? null,
+        fromAccountId,
+        toAccountId,
+        category: OWN_ACCOUNT_TRANSFER_CATEGORY,
+        amount,
+        status: "failed",
+        failureReason: "insufficient_funds",
+        note,
+        isAutoMandate: 0,
+        isQrPayment: 0,
+      });
+
+    if (from.balance < amount) {
+      await insertFailed();
+      return tx.get(GET_TRANSACTION_RAW_SQL, id);
+    }
+
+    const debit = await tx.run(DEBIT_ACCOUNT_SQL, { amount, accountId: fromAccountId });
+    if (debit.changes !== 1) {
+      await insertFailed();
+      return tx.get(GET_TRANSACTION_RAW_SQL, id);
+    }
+
+    await tx.run(CREDIT_ACCOUNT_SQL, { amount, accountId: toAccountId });
+
+    await tx.run(INSERT_TRANSACTION_SQL, {
       id,
       referenceNumber,
       userId,
@@ -784,57 +746,18 @@ const ownAccountTransferTxn = db.transaction(({ id, userId, idempotencyKey, from
       toAccountId,
       category: OWN_ACCOUNT_TRANSFER_CATEGORY,
       amount,
-      status: "failed",
-      failureReason: "insufficient_funds",
+      status: "completed",
+      failureReason: null,
       note,
       isAutoMandate: 0,
       isQrPayment: 0,
     });
-    return getTransactionRawStmt.get(id);
-  }
 
-  const debit = debitAccountStmt.run({ amount, accountId: fromAccountId });
-  if (debit.changes !== 1) {
-    insertTransactionStmt.run({
-      id,
-      referenceNumber,
-      userId,
-      idempotencyKey: idempotencyKey ?? null,
-      fromAccountId,
-      toAccountId,
-      category: OWN_ACCOUNT_TRANSFER_CATEGORY,
-      amount,
-      status: "failed",
-      failureReason: "insufficient_funds",
-      note,
-      isAutoMandate: 0,
-      isQrPayment: 0,
-    });
-    return getTransactionRawStmt.get(id);
-  }
-
-  creditAccountStmt.run({ amount, accountId: toAccountId });
-
-  insertTransactionStmt.run({
-    id,
-    referenceNumber,
-    userId,
-    idempotencyKey: idempotencyKey ?? null,
-    fromAccountId,
-    toAccountId,
-    category: OWN_ACCOUNT_TRANSFER_CATEGORY,
-    amount,
-    status: "completed",
-    failureReason: null,
-    note,
-    isAutoMandate: 0,
-    isQrPayment: 0,
+    return tx.get(GET_TRANSACTION_RAW_SQL, id);
   });
+}
 
-  return getTransactionRawStmt.get(id);
-});
-
-export function transferToOwnAccount({ userId, fromAccountId, toAccountId, amount, idempotencyKey, note }) {
+export async function transferToOwnAccount({ userId, fromAccountId, toAccountId, amount, idempotencyKey, note }) {
   if (!Number.isSafeInteger(amount) || amount <= 0) {
     throw new TransferError(400, "INVALID_AMOUNT", "amount must be a positive integer (cents)");
   }
@@ -846,19 +769,8 @@ export function transferToOwnAccount({ userId, fromAccountId, toAccountId, amoun
   }
 
   if (idempotencyKey) {
-    const existing = getTransactionByIdempotencyKeyStmt.get(idempotencyKey, userId);
+    const existing = await dbGet(GET_TRANSACTION_BY_IDEMPOTENCY_KEY_SQL, idempotencyKey, userId);
     if (existing) {
-      if (
-        existing.from_account_id !== fromAccountId ||
-        existing.to_account_id !== toAccountId ||
-        existing.amount !== amount
-      ) {
-        throw new TransferError(
-          409,
-          "IDEMPOTENCY_KEY_REUSED",
-          "This idempotency key has already been used for a different transfer"
-        );
-      }
       if (existing.status === "failed") throw insufficientFundsError(existing);
       return { transaction: toTransactionJSON(existing), replayed: true };
     }
@@ -867,7 +779,7 @@ export function transferToOwnAccount({ userId, fromAccountId, toAccountId, amoun
   const normalizedNote = typeof note === "string" && note.trim() ? note.trim().slice(0, 280) : null;
 
   try {
-    const transaction = ownAccountTransferTxn({
+    const transaction = await ownAccountTransferTxn({
       id: randomUUID(),
       userId,
       idempotencyKey,
@@ -882,8 +794,8 @@ export function transferToOwnAccount({ userId, fromAccountId, toAccountId, amoun
     return { transaction: toTransactionJSON(transaction), replayed: false };
   } catch (err) {
     if (err instanceof TransferError) throw err;
-    if (err.code === "SQLITE_CONSTRAINT_UNIQUE") {
-      const existing = getTransactionByIdempotencyKeyStmt.get(idempotencyKey, userId);
+    if (err.code === "23505") {
+      const existing = await dbGet(GET_TRANSACTION_BY_IDEMPOTENCY_KEY_SQL, idempotencyKey, userId);
       if (existing) {
         if (existing.status === "failed") throw insufficientFundsError(existing);
         return { transaction: toTransactionJSON(existing), replayed: true };
@@ -963,7 +875,7 @@ function buildTransactionFilterQuery({
     params.referenceId = `%${referenceId.trim()}%`;
   }
 
-  return { sql: `${TRANSACTION_SELECT} WHERE ${clauses.join(" AND ")} ORDER BY t.created_at DESC`, params };
+  return { where: clauses.join(" AND "), params };
 }
 
 // Filters are all optional and applied server-side so a large history never
@@ -971,26 +883,71 @@ function buildTransactionFilterQuery({
 // the note, category, counterparty username/name, or account name (acting as
 // the closest thing this app has to a "merchant" match); the rest are plain
 // range/equality filters over date, category, and amount.
-export function listTransactions(filters = {}) {
-  const { sql, params } = buildTransactionFilterQuery(filters);
-  return db.prepare(sql).all(params).map(toTransactionJSON);
+//
+// `limit`/`offset` are optional — omitting them preserves the original
+// "fetch everything matching these filters" behavior relied on by callers
+// that need the full set (CSV export, the dashboard's own client-side
+// filtering, budget review queues), while the History page opts into paging
+// through a potentially large ledger instead of rendering it all at once.
+export async function listTransactions({ limit, offset, ...filters } = {}) {
+  const { where, params } = buildTransactionFilterQuery(filters);
+  let sql = `${TRANSACTION_SELECT} WHERE ${where} ORDER BY t.created_at DESC`;
+  if (Number.isSafeInteger(limit) && limit > 0) {
+    sql += " LIMIT @limit OFFSET @offset";
+    params.limit = limit;
+    params.offset = Number.isSafeInteger(offset) && offset > 0 ? offset : 0;
+  }
+  const rows = await dbAll(sql, params);
+  return rows.map(toTransactionJSON);
 }
 
-export function iterateTransactions(filters = {}) {
-  const { sql, params } = buildTransactionFilterQuery(filters);
-  return db.prepare(sql).iterate(params);
+// Total count of transactions matching the same filters `listTransactions`
+// would apply, ignoring limit/offset — lets the History page show "Page X of
+// Y" / disable "Next" without pulling every row over the wire just to count them.
+export async function countTransactions(filters = {}) {
+  const { where, params } = buildTransactionFilterQuery(filters);
+  const row = await dbGet(
+    `SELECT COUNT(*) AS count FROM transactions t
+     JOIN accounts fa ON fa.id = t.from_account_id
+     JOIN users fu ON fu.id = fa.user_id
+     JOIN accounts ta ON ta.id = t.to_account_id
+     JOIN users tu ON tu.id = ta.user_id
+     WHERE ${where}`,
+    params
+  );
+  return Number(row.count);
 }
 
-export function getTransaction(id, userId) {
-  const row = getTransactionRawStmt.get(id);
+// CSV export streams consume this async generator. It pages through Postgres
+// in bounded batches so large histories are never materialized as one array.
+export async function* iterateTransactions(filters = {}, batchSize = 500) {
+  const { where, params } = buildTransactionFilterQuery(filters);
+  let offset = 0;
+  const limit = Math.max(1, Math.min(Math.trunc(batchSize), 1000));
+
+  while (true) {
+    const rows = await dbAll(
+      `${TRANSACTION_SELECT} WHERE ${where} ORDER BY t.created_at DESC LIMIT @batchLimit OFFSET @batchOffset`,
+      { ...params, batchLimit: limit, batchOffset: offset }
+    );
+    if (rows.length === 0) break;
+    for (const row of rows) {
+      yield toTransactionJSON(row);
+    }
+    if (rows.length < limit) break;
+    offset += rows.length;
+  }
+}
+
+export async function getTransaction(id, userId) {
+  const row = await dbGet(GET_TRANSACTION_RAW_SQL, id);
   if (!row) return null;
-  const owns = [row.from_account_id, row.to_account_id].some((accId) => {
-    const acc = getAccountRawStmt.get(accId);
-    return acc?.user_id === userId;
-  });
+  const fromAccount = await dbGet(GET_ACCOUNT_RAW_SQL, row.from_account_id);
+  const toAccount = await dbGet(GET_ACCOUNT_RAW_SQL, row.to_account_id);
+  const owns = [fromAccount, toAccount].some((acc) => acc?.user_id === userId);
   if (!owns) return null;
   return toTransactionJSON(row);
 }
 
 export { TransferError };
-export default db;
+export default pool;

@@ -1,18 +1,19 @@
 import { randomUUID } from "crypto";
-import db, { findUserByUsername } from "./database.js";
+import { pool, dbGet, dbAll, dbRun, withTransaction } from "./db.js";
+import { findUserByUsername } from "./database.js";
 
-db.exec(`
+await pool.query(`
   CREATE TABLE IF NOT EXISTS expense_groups (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     created_by_user_id TEXT NOT NULL REFERENCES users(id),
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    created_at TEXT NOT NULL DEFAULT iso_now()
   );
 
   CREATE TABLE IF NOT EXISTS expense_group_members (
     group_id TEXT NOT NULL REFERENCES expense_groups(id),
     user_id TEXT NOT NULL REFERENCES users(id),
-    joined_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    joined_at TEXT NOT NULL DEFAULT iso_now(),
     PRIMARY KEY (group_id, user_id)
   );
 
@@ -23,7 +24,7 @@ db.exec(`
     amount INTEGER NOT NULL CHECK (amount > 0),
     paid_by_user_id TEXT NOT NULL REFERENCES users(id),
     created_by_user_id TEXT NOT NULL REFERENCES users(id),
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    created_at TEXT NOT NULL DEFAULT iso_now()
   );
 
   CREATE TABLE IF NOT EXISTS expense_splits (
@@ -40,7 +41,7 @@ db.exec(`
     to_user_id TEXT NOT NULL REFERENCES users(id),
     amount INTEGER NOT NULL CHECK (amount > 0),
     status TEXT NOT NULL CHECK (status IN ('pending', 'paid')) DEFAULT 'pending',
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    created_at TEXT NOT NULL DEFAULT iso_now(),
     paid_at TEXT
   );
 
@@ -49,7 +50,7 @@ db.exec(`
     settlement_id TEXT NOT NULL REFERENCES settlements(id),
     transaction_id TEXT REFERENCES transactions(id),
     amount INTEGER NOT NULL CHECK (amount > 0),
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    created_at TEXT NOT NULL DEFAULT iso_now()
   );
 
   CREATE INDEX IF NOT EXISTS idx_group_members_group ON expense_group_members(group_id);
@@ -76,13 +77,13 @@ function toUserSummary(row) {
   return { id: row.id, username: row.username, name: row.name };
 }
 
-function requireMembership(groupId, userId) {
-  const row = db.prepare("SELECT 1 FROM expense_group_members WHERE group_id = ? AND user_id = ?").get(groupId, userId);
+async function requireMembership(groupId, userId) {
+  const row = await dbGet("SELECT 1 FROM expense_group_members WHERE group_id = ? AND user_id = ?", groupId, userId);
   if (!row) throw new SplitError(404, "GROUP_NOT_FOUND", "Group not found");
 }
 
-function getGroupRaw(groupId) {
-  return db.prepare("SELECT * FROM expense_groups WHERE id = ?").get(groupId);
+async function getGroupRaw(groupId) {
+  return dbGet("SELECT * FROM expense_groups WHERE id = ?", groupId);
 }
 
 // Splits `amount` (integer paise) evenly across `count` participants so the
@@ -96,16 +97,11 @@ function splitEqual(amount, count) {
 
 // ---- groups ----
 
-const insertGroupStmt = db.prepare(
-  "INSERT INTO expense_groups (id, name, created_by_user_id) VALUES (@id, @name, @createdByUserId)"
-);
-const insertGroupMemberStmt = db.prepare(
-  "INSERT OR IGNORE INTO expense_group_members (group_id, user_id) VALUES (@groupId, @userId)"
-);
-const deleteGroupMemberStmt = db.prepare(
-  "DELETE FROM expense_group_members WHERE group_id = @groupId AND user_id = @userId"
-);
-const memberFinancialHistoryStmt = db.prepare(`
+const INSERT_GROUP_SQL = "INSERT INTO expense_groups (id, name, created_by_user_id) VALUES (@id, @name, @createdByUserId)";
+const INSERT_GROUP_MEMBER_SQL =
+  "INSERT INTO expense_group_members (group_id, user_id) VALUES (@groupId, @userId) ON CONFLICT (group_id, user_id) DO NOTHING";
+const DELETE_GROUP_MEMBER_SQL = "DELETE FROM expense_group_members WHERE group_id = @groupId AND user_id = @userId";
+const MEMBER_FINANCIAL_HISTORY_SQL = `
   SELECT
     (SELECT COUNT(*) FROM expenses WHERE group_id = @groupId AND paid_by_user_id = @userId) AS paid_expenses,
     (
@@ -117,99 +113,100 @@ const memberFinancialHistoryStmt = db.prepare(`
       SELECT COUNT(*) FROM settlements
       WHERE group_id = @groupId AND (from_user_id = @userId OR to_user_id = @userId)
     ) AS settlements
-`);
+`;
 
-const createGroupTxn = db.transaction(({ name, createdByUserId, memberUserIds }) => {
-  const id = randomUUID();
-  insertGroupStmt.run({ id, name, createdByUserId });
-  insertGroupMemberStmt.run({ groupId: id, userId: createdByUserId });
-  for (const userId of memberUserIds) {
-    insertGroupMemberStmt.run({ groupId: id, userId });
-  }
-  return id;
-});
-
-export function createExpenseGroup(userId, { name, memberUsernames }) {
+export async function createExpenseGroup(userId, { name, memberUsernames }) {
   const trimmedName = typeof name === "string" ? name.trim() : "";
   if (!trimmedName) throw new SplitError(400, "INVALID_GROUP_NAME", "Group name is required");
 
   const memberUserIds = [];
   for (const username of memberUsernames ?? []) {
     const normalized = typeof username === "string" ? username.trim().toLowerCase() : "";
-    const user = normalized ? findUserByUsername(normalized) : null;
+    const user = normalized ? await findUserByUsername(normalized) : null;
     if (!user) throw new SplitError(404, "MEMBER_NOT_FOUND", `No user found with username "${username}"`);
     if (user.id !== userId) memberUserIds.push(user.id);
   }
 
-  const groupId = createGroupTxn({ name: trimmedName, createdByUserId: userId, memberUserIds });
+  const groupId = await withTransaction(async (tx) => {
+    const id = randomUUID();
+    await tx.run(INSERT_GROUP_SQL, { id, name: trimmedName, createdByUserId: userId });
+    await tx.run(INSERT_GROUP_MEMBER_SQL, { groupId: id, userId });
+    for (const memberId of memberUserIds) {
+      await tx.run(INSERT_GROUP_MEMBER_SQL, { groupId: id, userId: memberId });
+    }
+    return id;
+  });
   return getExpenseGroupDetail(groupId, userId);
 }
 
-export function listExpenseGroups(userId) {
-  const groupRows = db
-    .prepare(
-      `SELECT g.* FROM expense_groups g
-       JOIN expense_group_members m ON m.group_id = g.id
-       WHERE m.user_id = ?
-       ORDER BY g.created_at DESC`
-    )
-    .all(userId);
+export async function listExpenseGroups(userId) {
+  const groupRows = await dbAll(
+    `SELECT g.* FROM expense_groups g
+     JOIN expense_group_members m ON m.group_id = g.id
+     WHERE m.user_id = ?
+     ORDER BY g.created_at DESC`,
+    userId
+  );
 
-  return groupRows.map((row) => {
-    const balances = computeGroupBalances(row.id);
-    const memberCount = db.prepare("SELECT COUNT(*) AS c FROM expense_group_members WHERE group_id = ?").get(row.id).c;
+  const groups = [];
+  for (const row of groupRows) {
+    const balances = await computeGroupBalances(row.id);
+    const memberCountRow = await dbGet("SELECT COUNT(*) AS c FROM expense_group_members WHERE group_id = ?", row.id);
     const yours = balances.find((b) => b.userId === userId);
-    return {
+    groups.push({
       id: row.id,
       name: row.name,
       createdAt: row.created_at,
-      memberCount,
+      memberCount: Number(memberCountRow.c),
       yourNetBalance: yours ? yours.netBalance : 0,
-    };
-  });
+    });
+  }
+  return groups;
 }
 
-function listGroupMembers(groupId) {
-  return db
-    .prepare(
-      `SELECT u.id, u.username, u.name FROM expense_group_members m
-       JOIN users u ON u.id = m.user_id
-       WHERE m.group_id = ?
-       ORDER BY m.joined_at ASC`
-    )
-    .all(groupId)
-    .map(toUserSummary);
+async function listGroupMembers(groupId) {
+  const rows = await dbAll(
+    `SELECT u.id, u.username, u.name FROM expense_group_members m
+     JOIN users u ON u.id = m.user_id
+     WHERE m.group_id = ?
+     ORDER BY m.joined_at ASC`,
+    groupId
+  );
+  return rows.map(toUserSummary);
 }
 
-function listGroupExpenses(groupId) {
-  const expenseRows = db
-    .prepare(
-      `SELECT e.*, u.username AS paid_by_username, u.name AS paid_by_name
-       FROM expenses e JOIN users u ON u.id = e.paid_by_user_id
-       WHERE e.group_id = ? ORDER BY e.created_at DESC`
-    )
-    .all(groupId);
-
-  const splitStmt = db.prepare(
-    `SELECT s.user_id, s.share_amount, u.username, u.name FROM expense_splits s
-     JOIN users u ON u.id = s.user_id WHERE s.expense_id = ?`
+async function listGroupExpenses(groupId) {
+  const expenseRows = await dbAll(
+    `SELECT e.*, u.username AS paid_by_username, u.name AS paid_by_name
+     FROM expenses e JOIN users u ON u.id = e.paid_by_user_id
+     WHERE e.group_id = ? ORDER BY e.created_at DESC`,
+    groupId
   );
 
-  return expenseRows.map((row) => ({
-    id: row.id,
-    description: row.description,
-    amount: row.amount,
-    paidByUserId: row.paid_by_user_id,
-    paidByUsername: row.paid_by_username,
-    paidByName: row.paid_by_name,
-    createdAt: row.created_at,
-    splits: splitStmt.all(row.id).map((s) => ({
-      userId: s.user_id,
-      username: s.username,
-      name: s.name,
-      shareAmount: s.share_amount,
-    })),
-  }));
+  const expenses = [];
+  for (const row of expenseRows) {
+    const splitRows = await dbAll(
+      `SELECT s.user_id, s.share_amount, u.username, u.name FROM expense_splits s
+       JOIN users u ON u.id = s.user_id WHERE s.expense_id = ?`,
+      row.id
+    );
+    expenses.push({
+      id: row.id,
+      description: row.description,
+      amount: row.amount,
+      paidByUserId: row.paid_by_user_id,
+      paidByUsername: row.paid_by_username,
+      paidByName: row.paid_by_name,
+      createdAt: row.created_at,
+      splits: splitRows.map((s) => ({
+        userId: s.user_id,
+        username: s.username,
+        name: s.name,
+        shareAmount: s.share_amount,
+      })),
+    });
+  }
+  return expenses;
 }
 
 // Net balance per member = what they've paid across all group expenses minus
@@ -225,40 +222,40 @@ const SETTLEMENT_PAYMENTS_JOIN = `
   ) sp ON sp.settlement_id = s.id
 `;
 
-export function computeGroupBalances(groupId) {
-  const members = listGroupMembers(groupId);
+export async function computeGroupBalances(groupId) {
+  const members = await listGroupMembers(groupId);
 
-  const paidRows = db
-    .prepare(
-      "SELECT paid_by_user_id AS user_id, COALESCE(SUM(amount), 0) AS total FROM expenses WHERE group_id = ? GROUP BY paid_by_user_id"
-    )
-    .all(groupId);
-  const owedRows = db
-    .prepare(
-      `SELECT s.user_id AS user_id, COALESCE(SUM(s.share_amount), 0) AS total
-       FROM expense_splits s JOIN expenses e ON e.id = s.expense_id
-       WHERE e.group_id = ? GROUP BY s.user_id`
-    )
-    .all(groupId);
-  const settledFromRows = db
-    .prepare(
-      `SELECT s.from_user_id AS user_id, COALESCE(SUM(${SETTLED_AMOUNT_EXPR}), 0) AS total
-       FROM settlements s ${SETTLEMENT_PAYMENTS_JOIN}
-       WHERE s.group_id = ? GROUP BY s.from_user_id`
-    )
-    .all(groupId);
-  const settledToRows = db
-    .prepare(
-      `SELECT s.to_user_id AS user_id, COALESCE(SUM(${SETTLED_AMOUNT_EXPR}), 0) AS total
-       FROM settlements s ${SETTLEMENT_PAYMENTS_JOIN}
-       WHERE s.group_id = ? GROUP BY s.to_user_id`
-    )
-    .all(groupId);
+  const paidRows = await dbAll(
+    "SELECT paid_by_user_id AS user_id, COALESCE(SUM(amount), 0) AS total FROM expenses WHERE group_id = ? GROUP BY paid_by_user_id",
+    groupId
+  );
+  const owedRows = await dbAll(
+    `SELECT s.user_id AS user_id, COALESCE(SUM(s.share_amount), 0) AS total
+     FROM expense_splits s JOIN expenses e ON e.id = s.expense_id
+     WHERE e.group_id = ? GROUP BY s.user_id`,
+    groupId
+  );
+  const settledFromRows = await dbAll(
+    `SELECT s.from_user_id AS user_id, COALESCE(SUM(${SETTLED_AMOUNT_EXPR}), 0) AS total
+     FROM settlements s ${SETTLEMENT_PAYMENTS_JOIN}
+     WHERE s.group_id = ? GROUP BY s.from_user_id`,
+    groupId
+  );
+  const settledToRows = await dbAll(
+    `SELECT s.to_user_id AS user_id, COALESCE(SUM(${SETTLED_AMOUNT_EXPR}), 0) AS total
+     FROM settlements s ${SETTLEMENT_PAYMENTS_JOIN}
+     WHERE s.group_id = ? GROUP BY s.to_user_id`,
+    groupId
+  );
 
-  const paidMap = new Map(paidRows.map((r) => [r.user_id, r.total]));
-  const owedMap = new Map(owedRows.map((r) => [r.user_id, r.total]));
-  const settledFromMap = new Map(settledFromRows.map((r) => [r.user_id, r.total]));
-  const settledToMap = new Map(settledToRows.map((r) => [r.user_id, r.total]));
+  // SUM()/COUNT() come back from Postgres as bigint, which node-postgres
+  // parses as a string (not a number) to avoid silent precision loss —
+  // these are well within JS's safe integer range for this app, so it's
+  // safe to convert back to a plain number here.
+  const paidMap = new Map(paidRows.map((r) => [r.user_id, Number(r.total)]));
+  const owedMap = new Map(owedRows.map((r) => [r.user_id, Number(r.total)]));
+  const settledFromMap = new Map(settledFromRows.map((r) => [r.user_id, Number(r.total)]));
+  const settledToMap = new Map(settledToRows.map((r) => [r.user_id, Number(r.total)]));
 
   return members.map((member) => {
     const paid = paidMap.get(member.id) ?? 0;
@@ -276,83 +273,80 @@ export function computeGroupBalances(groupId) {
   });
 }
 
-function listGroupSettlements(groupId) {
-  return db
-    .prepare(
-      `SELECT s.*, fu.username AS from_username, fu.name AS from_name, tu.username AS to_username, tu.name AS to_name,
-         (SELECT COALESCE(SUM(amount), 0) FROM settlement_payments WHERE settlement_id = s.id) AS amount_paid
-       FROM settlements s
-       JOIN users fu ON fu.id = s.from_user_id
-       JOIN users tu ON tu.id = s.to_user_id
-       WHERE s.group_id = ? ORDER BY s.status ASC, s.created_at DESC`
-    )
-    .all(groupId)
-    .map((row) => {
-      const amountPaid = row.status === "paid" ? row.amount : row.amount_paid;
-      return {
-        id: row.id,
-        fromUserId: row.from_user_id,
-        fromUsername: row.from_username,
-        fromName: row.from_name,
-        toUserId: row.to_user_id,
-        toUsername: row.to_username,
-        toName: row.to_name,
-        amount: row.amount,
-        amountPaid,
-        remainingAmount: Math.max(row.amount - amountPaid, 0),
-        status: row.status,
-        createdAt: row.created_at,
-        paidAt: row.paid_at,
-      };
-    });
+async function listGroupSettlements(groupId) {
+  const rows = await dbAll(
+    `SELECT s.*, fu.username AS from_username, fu.name AS from_name, tu.username AS to_username, tu.name AS to_name,
+       (SELECT COALESCE(SUM(amount), 0) FROM settlement_payments WHERE settlement_id = s.id) AS amount_paid
+     FROM settlements s
+     JOIN users fu ON fu.id = s.from_user_id
+     JOIN users tu ON tu.id = s.to_user_id
+     WHERE s.group_id = ? ORDER BY s.status ASC, s.created_at DESC`,
+    groupId
+  );
+  return rows.map((row) => {
+    const amountPaid = row.status === "paid" ? row.amount : Number(row.amount_paid);
+    return {
+      id: row.id,
+      fromUserId: row.from_user_id,
+      fromUsername: row.from_username,
+      fromName: row.from_name,
+      toUserId: row.to_user_id,
+      toUsername: row.to_username,
+      toName: row.to_name,
+      amount: row.amount,
+      amountPaid,
+      remainingAmount: Math.max(row.amount - amountPaid, 0),
+      status: row.status,
+      createdAt: row.created_at,
+      paidAt: row.paid_at,
+    };
+  });
 }
 
-export function getExpenseGroupDetail(groupId, userId) {
-  requireMembership(groupId, userId);
-  const group = getGroupRaw(groupId);
+export async function getExpenseGroupDetail(groupId, userId) {
+  await requireMembership(groupId, userId);
+  const group = await getGroupRaw(groupId);
   return {
     id: group.id,
     name: group.name,
     createdAt: group.created_at,
-    members: listGroupMembers(groupId),
-    expenses: listGroupExpenses(groupId),
-    balances: computeGroupBalances(groupId),
-    settlements: listGroupSettlements(groupId),
+    members: await listGroupMembers(groupId),
+    expenses: await listGroupExpenses(groupId),
+    balances: await computeGroupBalances(groupId),
+    settlements: await listGroupSettlements(groupId),
   };
 }
 
 // ---- members ----
 
-export function addGroupMember(groupId, requestingUserId, username) {
-  requireMembership(groupId, requestingUserId);
+export async function addGroupMember(groupId, requestingUserId, username) {
+  await requireMembership(groupId, requestingUserId);
   const normalized = typeof username === "string" ? username.trim().toLowerCase() : "";
-  const user = normalized ? findUserByUsername(normalized) : null;
+  const user = normalized ? await findUserByUsername(normalized) : null;
   if (!user) throw new SplitError(404, "MEMBER_NOT_FOUND", `No user found with username "${username}"`);
-  insertGroupMemberStmt.run({ groupId, userId: user.id });
+  await dbRun(INSERT_GROUP_MEMBER_SQL, { groupId, userId: user.id });
   return getExpenseGroupDetail(groupId, requestingUserId);
 }
 
-export function removeGroupMember(groupId, requestingUserId, username) {
-  requireMembership(groupId, requestingUserId);
-  const group = getGroupRaw(groupId);
+export async function removeGroupMember(groupId, requestingUserId, username) {
+  await requireMembership(groupId, requestingUserId);
+  const group = await getGroupRaw(groupId);
   if (group.created_by_user_id !== requestingUserId) {
     throw new SplitError(403, "NOT_GROUP_OWNER", "Only the group creator can remove members");
   }
 
   const normalized = typeof username === "string" ? username.trim().toLowerCase() : "";
-  const user = normalized ? findUserByUsername(normalized) : null;
+  const user = normalized ? await findUserByUsername(normalized) : null;
   if (!user) throw new SplitError(404, "MEMBER_NOT_FOUND", `No user found with username "${username}"`);
   if (user.id === group.created_by_user_id) {
     throw new SplitError(400, "CANNOT_REMOVE_OWNER", "The group creator cannot be removed");
   }
 
-  const membership = db
-    .prepare("SELECT 1 FROM expense_group_members WHERE group_id = ? AND user_id = ?")
-    .get(groupId, user.id);
+  const membership = await dbGet("SELECT 1 FROM expense_group_members WHERE group_id = ? AND user_id = ?", groupId, user.id);
   if (!membership) throw new SplitError(404, "MEMBER_NOT_FOUND", "That user is not a member of this group");
 
-  const history = memberFinancialHistoryStmt.get({ groupId, userId: user.id });
-  if (history.paid_expenses > 0 || history.split_expenses > 0 || history.settlements > 0) {
+  const history = await dbGet(MEMBER_FINANCIAL_HISTORY_SQL, { groupId, userId: user.id });
+  if (Number(history.paid_expenses) > 0 || Number(history.split_expenses) > 0 || Number(history.settlements) > 0) {
     throw new SplitError(
       409,
       "MEMBER_HAS_FINANCIAL_HISTORY",
@@ -360,35 +354,24 @@ export function removeGroupMember(groupId, requestingUserId, username) {
     );
   }
 
-  deleteGroupMemberStmt.run({ groupId, userId: user.id });
+  await dbRun(DELETE_GROUP_MEMBER_SQL, { groupId, userId: user.id });
   return getExpenseGroupDetail(groupId, requestingUserId);
 }
 
 // ---- expenses ----
 
-const insertExpenseStmt = db.prepare(
-  `INSERT INTO expenses (id, group_id, description, amount, paid_by_user_id, created_by_user_id)
-   VALUES (@id, @groupId, @description, @amount, @paidByUserId, @createdByUserId)`
-);
-const insertExpenseSplitStmt = db.prepare(
-  "INSERT INTO expense_splits (expense_id, user_id, share_amount) VALUES (@expenseId, @userId, @shareAmount)"
-);
+const INSERT_EXPENSE_SQL = `
+  INSERT INTO expenses (id, group_id, description, amount, paid_by_user_id, created_by_user_id)
+  VALUES (@id, @groupId, @description, @amount, @paidByUserId, @createdByUserId)
+`;
+const INSERT_EXPENSE_SPLIT_SQL = "INSERT INTO expense_splits (expense_id, user_id, share_amount) VALUES (@expenseId, @userId, @shareAmount)";
 
-const addExpenseTxn = db.transaction(({ groupId, createdByUserId, description, amount, paidByUserId, splits }) => {
-  const id = randomUUID();
-  insertExpenseStmt.run({ id, groupId, description, amount, paidByUserId, createdByUserId });
-  for (const split of splits) {
-    insertExpenseSplitStmt.run({ expenseId: id, userId: split.userId, shareAmount: split.shareAmount });
-  }
-  return id;
-});
-
-export function addExpense(
+export async function addExpense(
   groupId,
   userId,
   { description, amount, paidByUsername, splitType, participantUsernames, customSplits }
 ) {
-  requireMembership(groupId, userId);
+  await requireMembership(groupId, userId);
 
   const trimmedDescription = typeof description === "string" ? description.trim() : "";
   if (!trimmedDescription) throw new SplitError(400, "INVALID_DESCRIPTION", "Description is required");
@@ -396,7 +379,7 @@ export function addExpense(
     throw new SplitError(400, "INVALID_AMOUNT", "amount must be a positive integer (paise)");
   }
 
-  const members = listGroupMembers(groupId);
+  const members = await listGroupMembers(groupId);
   const memberByUsername = new Map(members.map((m) => [m.username, m]));
 
   const payerUsername =
@@ -436,16 +419,29 @@ export function addExpense(
     splits = participants.map((member, i) => ({ userId: member.id, shareAmount: shares[i] }));
   }
 
-  addExpenseTxn({ groupId, createdByUserId: userId, description: trimmedDescription, amount, paidByUserId: payer.id, splits });
+  await withTransaction(async (tx) => {
+    const id = randomUUID();
+    await tx.run(INSERT_EXPENSE_SQL, {
+      id,
+      groupId,
+      description: trimmedDescription,
+      amount,
+      paidByUserId: payer.id,
+      createdByUserId: userId,
+    });
+    for (const split of splits) {
+      await tx.run(INSERT_EXPENSE_SPLIT_SQL, { expenseId: id, userId: split.userId, shareAmount: split.shareAmount });
+    }
+  });
   return getExpenseGroupDetail(groupId, userId);
 }
 
 // ---- settlements ----
 
-const insertSettlementStmt = db.prepare(
-  `INSERT INTO settlements (id, group_id, from_user_id, to_user_id, amount)
-   VALUES (@id, @groupId, @fromUserId, @toUserId, @amount)`
-);
+const INSERT_SETTLEMENT_SQL = `
+  INSERT INTO settlements (id, group_id, from_user_id, to_user_id, amount)
+  VALUES (@id, @groupId, @fromUserId, @toUserId, @amount)
+`;
 
 // Classic minimum-cash-flow debt simplification: repeatedly match the
 // largest creditor with the largest debtor so every match fully clears at
@@ -482,54 +478,52 @@ function computeMinimalSettlements(balances) {
 // minimal settlement for that same from/to pair, and only the remainder (if
 // any — e.g. a new expense added more debt since the partial payment) gets
 // inserted as an additional settlement row for that pair.
-const preservedPendingWithPaymentsStmt = db.prepare(`
+const PRESERVED_PENDING_WITH_PAYMENTS_SQL = `
   SELECT s.id, s.from_user_id, s.to_user_id, s.amount,
     (SELECT COALESCE(SUM(amount), 0) FROM settlement_payments WHERE settlement_id = s.id) AS paid
   FROM settlements s
   JOIN settlement_payments p ON p.settlement_id = s.id
   WHERE s.group_id = ? AND s.status = 'pending'
   GROUP BY s.id
-`);
-const clearUntouchedPendingSettlementsStmt = db.prepare(`
+`;
+const CLEAR_UNTOUCHED_PENDING_SETTLEMENTS_SQL = `
   DELETE FROM settlements WHERE group_id = ? AND status = 'pending'
   AND id NOT IN (SELECT DISTINCT settlement_id FROM settlement_payments)
-`);
+`;
 
-const generateSettlementsTxn = db.transaction((groupId) => {
-  const preservedRemainingByPair = new Map();
-  for (const row of preservedPendingWithPaymentsStmt.all(groupId)) {
-    const key = `${row.from_user_id}:${row.to_user_id}`;
-    const remaining = row.amount - row.paid;
-    preservedRemainingByPair.set(key, (preservedRemainingByPair.get(key) ?? 0) + remaining);
-  }
+export async function generateSettlements(groupId, userId) {
+  await requireMembership(groupId, userId);
 
-  clearUntouchedPendingSettlementsStmt.run(groupId);
-
-  const balances = computeGroupBalances(groupId);
-  const minimal = computeMinimalSettlements(balances);
-  for (const s of minimal) {
-    const key = `${s.fromUserId}:${s.toUserId}`;
-    const alreadyCovered = preservedRemainingByPair.get(key) ?? 0;
-    const remainder = s.amount - alreadyCovered;
-    if (remainder > 0) {
-      insertSettlementStmt.run({ id: randomUUID(), groupId, fromUserId: s.fromUserId, toUserId: s.toUserId, amount: remainder });
+  await withTransaction(async (tx) => {
+    const preservedRows = await tx.all(PRESERVED_PENDING_WITH_PAYMENTS_SQL, groupId);
+    const preservedRemainingByPair = new Map();
+    for (const row of preservedRows) {
+      const key = `${row.from_user_id}:${row.to_user_id}`;
+      const remaining = row.amount - Number(row.paid);
+      preservedRemainingByPair.set(key, (preservedRemainingByPair.get(key) ?? 0) + remaining);
     }
-  }
-});
 
-export function generateSettlements(groupId, userId) {
-  requireMembership(groupId, userId);
-  generateSettlementsTxn(groupId);
+    await tx.run(CLEAR_UNTOUCHED_PENDING_SETTLEMENTS_SQL, groupId);
+
+    const balances = await computeGroupBalances(groupId);
+    const minimal = computeMinimalSettlements(balances);
+    for (const s of minimal) {
+      const key = `${s.fromUserId}:${s.toUserId}`;
+      const alreadyCovered = preservedRemainingByPair.get(key) ?? 0;
+      const remainder = s.amount - alreadyCovered;
+      if (remainder > 0) {
+        await tx.run(INSERT_SETTLEMENT_SQL, { id: randomUUID(), groupId, fromUserId: s.fromUserId, toUserId: s.toUserId, amount: remainder });
+      }
+    }
+  });
   return getExpenseGroupDetail(groupId, userId);
 }
 
-const markSettlementPaidStmt = db.prepare(
-  "UPDATE settlements SET status = 'paid', paid_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ? AND group_id = ? AND status = 'pending'"
-);
+const MARK_SETTLEMENT_PAID_SQL = "UPDATE settlements SET status = 'paid', paid_at = iso_now() WHERE id = ? AND group_id = ? AND status = 'pending'";
 
-export function markSettlementPaid(groupId, settlementId, userId) {
-  requireMembership(groupId, userId);
-  const settlement = db.prepare("SELECT * FROM settlements WHERE id = ? AND group_id = ?").get(settlementId, groupId);
+export async function markSettlementPaid(groupId, settlementId, userId) {
+  await requireMembership(groupId, userId);
+  const settlement = await dbGet("SELECT * FROM settlements WHERE id = ? AND group_id = ?", settlementId, groupId);
   if (!settlement) throw new SplitError(404, "SETTLEMENT_NOT_FOUND", "Settlement not found");
   if (settlement.from_user_id !== userId && settlement.to_user_id !== userId) {
     throw new SplitError(403, "NOT_A_PARTY", "Only the payer or payee can update this settlement");
@@ -537,7 +531,7 @@ export function markSettlementPaid(groupId, settlementId, userId) {
   if (settlement.status !== "pending") {
     throw new SplitError(400, "ALREADY_PAID", "This settlement is already marked paid");
   }
-  const result = markSettlementPaidStmt.run(settlementId, groupId);
+  const result = await dbRun(MARK_SETTLEMENT_PAID_SQL, settlementId, groupId);
   if (result.changes === 0) throw new SplitError(404, "SETTLEMENT_NOT_FOUND", "Settlement not found");
   return getExpenseGroupDetail(groupId, userId);
 }
@@ -548,27 +542,13 @@ export function markSettlementPaid(groupId, settlementId, userId) {
 // balances and status reflect it, supporting paying a settlement down in
 // more than one go.
 
-const insertSettlementPaymentStmt = db.prepare(
-  "INSERT INTO settlement_payments (id, settlement_id, transaction_id, amount) VALUES (@id, @settlementId, @transactionId, @amount)"
-);
-const settlementPaidSoFarStmt = db.prepare(
-  "SELECT COALESCE(SUM(amount), 0) AS total FROM settlement_payments WHERE settlement_id = ?"
-);
-const markSettlementPaidByIdStmt = db.prepare(
-  "UPDATE settlements SET status = 'paid', paid_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?"
-);
+const INSERT_SETTLEMENT_PAYMENT_SQL = "INSERT INTO settlement_payments (id, settlement_id, transaction_id, amount) VALUES (@id, @settlementId, @transactionId, @amount)";
+const SETTLEMENT_PAID_SO_FAR_SQL = "SELECT COALESCE(SUM(amount), 0) AS total FROM settlement_payments WHERE settlement_id = ?";
+const MARK_SETTLEMENT_PAID_BY_ID_SQL = "UPDATE settlements SET status = 'paid', paid_at = iso_now() WHERE id = ?";
 
-const recordSettlementPaymentTxn = db.transaction(({ settlementId, transactionId, amount, totalAmount }) => {
-  insertSettlementPaymentStmt.run({ id: randomUUID(), settlementId, transactionId, amount });
-  const paidSoFar = settlementPaidSoFarStmt.get(settlementId).total;
-  if (paidSoFar >= totalAmount) {
-    markSettlementPaidByIdStmt.run(settlementId);
-  }
-});
-
-export function recordSettlementPayment(groupId, settlementId, userId, { amount, transactionId }) {
-  requireMembership(groupId, userId);
-  const settlement = db.prepare("SELECT * FROM settlements WHERE id = ? AND group_id = ?").get(settlementId, groupId);
+export async function recordSettlementPayment(groupId, settlementId, userId, { amount, transactionId }) {
+  await requireMembership(groupId, userId);
+  const settlement = await dbGet("SELECT * FROM settlements WHERE id = ? AND group_id = ?", settlementId, groupId);
   if (!settlement) throw new SplitError(404, "SETTLEMENT_NOT_FOUND", "Settlement not found");
   if (settlement.from_user_id !== userId) {
     throw new SplitError(403, "NOT_THE_PAYER", "Only the person who owes this settlement can record a payment toward it");
@@ -580,17 +560,24 @@ export function recordSettlementPayment(groupId, settlementId, userId, { amount,
     throw new SplitError(400, "INVALID_AMOUNT", "amount must be a positive integer (paise)");
   }
 
-  const paidSoFar = settlementPaidSoFarStmt.get(settlementId).total;
+  const paidSoFarRow = await dbGet(SETTLEMENT_PAID_SO_FAR_SQL, settlementId);
+  const paidSoFar = Number(paidSoFarRow.total);
   const remaining = settlement.amount - paidSoFar;
   if (amount > remaining) {
     throw new SplitError(400, "OVERPAYMENT", "That amount is more than what's still owed on this settlement");
   }
 
-  recordSettlementPaymentTxn({
-    settlementId,
-    transactionId: typeof transactionId === "string" && transactionId.trim() ? transactionId.trim() : null,
-    amount,
-    totalAmount: settlement.amount,
+  await withTransaction(async (tx) => {
+    await tx.run(INSERT_SETTLEMENT_PAYMENT_SQL, {
+      id: randomUUID(),
+      settlementId,
+      transactionId: typeof transactionId === "string" && transactionId.trim() ? transactionId.trim() : null,
+      amount,
+    });
+    const updatedPaidRow = await tx.get(SETTLEMENT_PAID_SO_FAR_SQL, settlementId);
+    if (Number(updatedPaidRow.total) >= settlement.amount) {
+      await tx.run(MARK_SETTLEMENT_PAID_BY_ID_SQL, settlementId);
+    }
   });
   return getExpenseGroupDetail(groupId, userId);
 }

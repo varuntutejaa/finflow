@@ -2,9 +2,15 @@ import { randomBytes, scryptSync, timingSafeEqual } from "crypto";
 import jwt from "jsonwebtoken";
 import { recordFailedPinAttempt, listFailedPinAttempts, clearFailedPinAttempts } from "../config/database.js";
 
-const JWT_SECRET = process.env.JWT_SECRET || "finflow-dev-secret-change-me";
+const isProduction = process.env.NODE_ENV === "production";
 const TOKEN_TTL = "7d";
 const SCRYPT_KEYLEN = 64;
+
+if (isProduction && (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32)) {
+  throw new Error("JWT_SECRET must be set to at least 32 characters when NODE_ENV=production");
+}
+
+const JWT_SECRET = process.env.JWT_SECRET || randomBytes(32).toString("hex");
 
 export function hashPassword(password) {
   const salt = randomBytes(16).toString("hex");
@@ -29,8 +35,8 @@ const PIN_LOCKOUT_DURATION_MS = 24 * 60 * 60 * 1000;
 // locks the account for 24 hours — a correct PIN resets the streak, and the
 // streak itself is cleared once the lockout window has fully elapsed, so a
 // stale lockout never blocks a fresh set of 3 attempts.
-export function checkPinAuthorization(user, pin) {
-  let failedAttempts = listFailedPinAttempts(user.id); // newest first
+export async function checkPinAuthorization(user, pin) {
+  let failedAttempts = await listFailedPinAttempts(user.id); // newest first
   if (failedAttempts.length >= PIN_LOCKOUT_THRESHOLD) {
     const unlockAt = failedAttempts[0] + PIN_LOCKOUT_DURATION_MS;
     if (Date.now() < unlockAt) {
@@ -42,7 +48,7 @@ export function checkPinAuthorization(user, pin) {
         unlockAt: unlockAtIso,
       };
     }
-    clearFailedPinAttempts(user.id);
+    await clearFailedPinAttempts(user.id);
     failedAttempts = [];
   }
 
@@ -53,7 +59,7 @@ export function checkPinAuthorization(user, pin) {
     return { status: 400, code: "INVALID_PIN", message: "UPI PIN must be exactly 4 digits" };
   }
   if (!verifyPassword(pin, user.upi_pin_hash)) {
-    recordFailedPinAttempt(user.id);
+    await recordFailedPinAttempt(user.id);
     const remaining = Math.max(0, PIN_LOCKOUT_THRESHOLD - (failedAttempts.length + 1));
     const message =
       remaining > 0
@@ -61,7 +67,7 @@ export function checkPinAuthorization(user, pin) {
         : "Incorrect UPI PIN. Your account is now locked for 24 hours.";
     return { status: 401, code: "INCORRECT_PIN", message, attemptsRemaining: remaining };
   }
-  clearFailedPinAttempts(user.id);
+  await clearFailedPinAttempts(user.id);
   return null;
 }
 
@@ -69,8 +75,8 @@ export function checkPinAuthorization(user, pin) {
 // (e.g. right on the dashboard) instead of only after the next failed
 // attempt. Mirrors checkPinAuthorization's lockout window exactly, but
 // never records or consumes an attempt.
-export function getPinLockoutStatus(userId) {
-  const failedAttempts = listFailedPinAttempts(userId);
+export async function getPinLockoutStatus(userId) {
+  const failedAttempts = await listFailedPinAttempts(userId);
   if (failedAttempts.length < PIN_LOCKOUT_THRESHOLD) {
     return { locked: false, unlockAt: null };
   }

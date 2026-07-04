@@ -1,9 +1,9 @@
 import { randomUUID } from "crypto";
 import ExcelJS from "exceljs";
-import db from "./database.js";
+import { pool, dbGet, dbAll, dbRun } from "./db.js";
 import { fetchMutualFundNav, resolveStockSymbol, fetchStockPrice } from "./priceFeeds.js";
 
-db.exec(`
+await pool.query(`
   CREATE TABLE IF NOT EXISTS investments (
     id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL REFERENCES users(id),
@@ -14,20 +14,16 @@ db.exec(`
     buy_price INTEGER NOT NULL CHECK (buy_price >= 0),
     current_price INTEGER NOT NULL CHECK (current_price >= 0),
     notes TEXT,
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    -- Caches the resolved Yahoo Finance ticker for a holding (e.g.
+    -- "ETERNAL.NS") so live price refreshes don't need to re-run the
+    -- name -> symbol search every time — only the first refresh pays that cost.
+    symbol TEXT,
+    created_at TEXT NOT NULL DEFAULT iso_now(),
+    updated_at TEXT NOT NULL DEFAULT iso_now()
   );
 
   CREATE INDEX IF NOT EXISTS idx_investments_user ON investments(user_id);
 `);
-
-// Caches the resolved Yahoo Finance ticker for a holding (e.g. "ETERNAL.NS")
-// so live price refreshes don't need to re-run the name -> symbol search
-// every time — only the first refresh for a given holding pays that cost.
-const investmentColumns = db.prepare("PRAGMA table_info(investments)").all().map((c) => c.name);
-if (!investmentColumns.includes("symbol")) {
-  db.exec("ALTER TABLE investments ADD COLUMN symbol TEXT");
-}
 
 export class InvestmentError extends Error {
   constructor(status, code, message) {
@@ -64,19 +60,16 @@ function toInvestmentJSON(row) {
   };
 }
 
-const insertInvestmentStmt = db.prepare(`
+const INSERT_INVESTMENT_SQL = `
   INSERT INTO investments (id, user_id, name, platform, type, quantity, buy_price, current_price, notes, symbol)
   VALUES (@id, @userId, @name, @platform, @type, @quantity, @buyPrice, @currentPrice, @notes, @symbol)
-`);
-const getInvestmentRawStmt = db.prepare("SELECT * FROM investments WHERE id = ? AND user_id = ?");
-const listInvestmentsStmt = db.prepare("SELECT * FROM investments WHERE user_id = ? ORDER BY created_at DESC");
-const deleteInvestmentStmt = db.prepare("DELETE FROM investments WHERE id = ? AND user_id = ?");
-const findInvestmentBySymbolStmt = db.prepare(
-  "SELECT * FROM investments WHERE user_id = ? AND type = ? AND symbol IS NOT NULL AND lower(symbol) = lower(?) ORDER BY updated_at DESC LIMIT 1"
-);
-const findInvestmentByIdentityStmt = db.prepare(
-  "SELECT * FROM investments WHERE user_id = ? AND type = ? AND lower(name) = lower(?) AND lower(platform) = lower(?) ORDER BY updated_at DESC LIMIT 1"
-);
+`;
+const GET_INVESTMENT_RAW_SQL = "SELECT * FROM investments WHERE id = ? AND user_id = ?";
+const LIST_INVESTMENTS_SQL = "SELECT * FROM investments WHERE user_id = ? ORDER BY created_at DESC";
+const FIND_INVESTMENT_BY_SYMBOL_SQL =
+  "SELECT * FROM investments WHERE user_id = ? AND type = ? AND symbol IS NOT NULL AND lower(symbol) = lower(?) ORDER BY updated_at DESC LIMIT 1";
+const FIND_INVESTMENT_BY_IDENTITY_SQL =
+  "SELECT * FROM investments WHERE user_id = ? AND type = ? AND lower(name) = lower(?) AND lower(platform) = lower(?) ORDER BY updated_at DESC LIMIT 1";
 
 function validateInvestmentInput({ name, platform, type, quantity, buyPrice, currentPrice }) {
   if (typeof name !== "string" || name.trim().length === 0) {
@@ -99,15 +92,15 @@ function validateInvestmentInput({ name, platform, type, quantity, buyPrice, cur
   }
 }
 
-export function createInvestment(userId, input) {
+export async function createInvestment(userId, input) {
   validateInvestmentInput(input);
   const type = input.type ?? "stock";
   const name = input.name.trim();
   const platform = (input.platform && input.platform.trim()) || "Manual";
   const symbol = input.symbol?.trim() || null;
   const existing = symbol
-    ? findInvestmentBySymbolStmt.get(userId, type, symbol)
-    : findInvestmentByIdentityStmt.get(userId, type, name, platform);
+    ? await dbGet(FIND_INVESTMENT_BY_SYMBOL_SQL, userId, type, symbol)
+    : await dbGet(FIND_INVESTMENT_BY_IDENTITY_SQL, userId, type, name, platform);
 
   if (existing) {
     const nextQuantity = existing.quantity + input.quantity;
@@ -127,7 +120,7 @@ export function createInvestment(userId, input) {
   }
 
   const id = randomUUID();
-  insertInvestmentStmt.run({
+  await dbRun(INSERT_INVESTMENT_SQL, {
     id,
     userId,
     name,
@@ -139,15 +132,16 @@ export function createInvestment(userId, input) {
     notes: input.notes?.trim() || null,
     symbol,
   });
-  return toInvestmentJSON(getInvestmentRawStmt.get(id, userId));
+  return toInvestmentJSON(await dbGet(GET_INVESTMENT_RAW_SQL, id, userId));
 }
 
-export function listInvestments(userId) {
-  return listInvestmentsStmt.all(userId).map(toInvestmentJSON);
+export async function listInvestments(userId) {
+  const rows = await dbAll(LIST_INVESTMENTS_SQL, userId);
+  return rows.map(toInvestmentJSON);
 }
 
-export function updateInvestment(userId, id, input) {
-  const existing = getInvestmentRawStmt.get(id, userId);
+export async function updateInvestment(userId, id, input) {
+  const existing = await dbGet(GET_INVESTMENT_RAW_SQL, id, userId);
   if (!existing) return null;
 
   const merged = {
@@ -162,35 +156,36 @@ export function updateInvestment(userId, id, input) {
   };
   validateInvestmentInput(merged);
 
-  db.prepare(
+  await dbRun(
     `UPDATE investments
      SET name = @name, platform = @platform, type = @type, quantity = @quantity,
          buy_price = @buyPrice, current_price = @currentPrice, notes = @notes, symbol = @symbol,
-         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-     WHERE id = @id AND user_id = @userId`
-  ).run({
-    id,
-    userId,
-    name: merged.name.trim(),
-    platform: (merged.platform && merged.platform.trim()) || "Manual",
-    type: merged.type,
-    quantity: merged.quantity,
-    buyPrice: merged.buyPrice,
-    currentPrice: merged.currentPrice,
-    notes: merged.notes?.trim ? merged.notes.trim() || null : merged.notes,
-    symbol: merged.symbol?.trim ? merged.symbol.trim() || null : merged.symbol,
-  });
+         updated_at = iso_now()
+     WHERE id = @id AND user_id = @userId`,
+    {
+      id,
+      userId,
+      name: merged.name.trim(),
+      platform: (merged.platform && merged.platform.trim()) || "Manual",
+      type: merged.type,
+      quantity: merged.quantity,
+      buyPrice: merged.buyPrice,
+      currentPrice: merged.currentPrice,
+      notes: merged.notes?.trim ? merged.notes.trim() || null : merged.notes,
+      symbol: merged.symbol?.trim ? merged.symbol.trim() || null : merged.symbol,
+    }
+  );
 
-  return toInvestmentJSON(getInvestmentRawStmt.get(id, userId));
+  return toInvestmentJSON(await dbGet(GET_INVESTMENT_RAW_SQL, id, userId));
 }
 
-export function deleteInvestment(userId, id) {
-  const result = deleteInvestmentStmt.run(id, userId);
+export async function deleteInvestment(userId, id) {
+  const result = await dbRun("DELETE FROM investments WHERE id = ? AND user_id = ?", id, userId);
   return result.changes > 0;
 }
 
-export function getInvestmentSummary(userId) {
-  const investments = listInvestments(userId);
+export async function getInvestmentSummary(userId) {
+  const investments = await listInvestments(userId);
   const investedValue = investments.reduce((sum, inv) => sum + inv.investedValue, 0);
   const currentValue = investments.reduce((sum, inv) => sum + inv.currentValue, 0);
   const gainLoss = currentValue - investedValue;
@@ -228,9 +223,13 @@ function cellText(value) {
   return String(value).trim();
 }
 
-async function loadXlsxRows(buffer) {
+async function loadXlsxRows(source) {
   const workbook = new ExcelJS.Workbook();
-  await workbook.xlsx.load(buffer);
+  if (Buffer.isBuffer(source)) {
+    await workbook.xlsx.load(source);
+  } else {
+    await workbook.xlsx.readFile(source);
+  }
   const worksheet = workbook.worksheets[0];
   if (!worksheet) {
     throw new InvestmentError(400, "UNPARSEABLE_XLSX", "This file has no sheets to read.");
@@ -393,22 +392,21 @@ export async function parseGrowwStockHoldingsXlsx(buffer) {
   return { rows, skippedCount: skipped.length };
 }
 
-const findInvestmentByNamePlatformStmt = db.prepare(
-  "SELECT id FROM investments WHERE user_id = ? AND lower(name) = lower(?) AND lower(platform) = lower(?)"
-);
+const FIND_INVESTMENT_BY_NAME_PLATFORM_SQL =
+  "SELECT id FROM investments WHERE user_id = ? AND lower(name) = lower(?) AND lower(platform) = lower(?)";
 
 // Re-importing the same statement should refresh existing holdings' numbers
 // rather than pile up duplicates, so this upserts by (name, platform).
-export function importInvestments(userId, rows) {
+export async function importInvestments(userId, rows) {
   let importedCount = 0;
   let updatedCount = 0;
   for (const row of rows) {
-    const existing = findInvestmentByNamePlatformStmt.get(userId, row.name, row.platform);
+    const existing = await dbGet(FIND_INVESTMENT_BY_NAME_PLATFORM_SQL, userId, row.name, row.platform);
     if (existing) {
-      updateInvestment(userId, existing.id, row);
+      await updateInvestment(userId, existing.id, row);
       updatedCount++;
     } else {
-      createInvestment(userId, row);
+      await createInvestment(userId, row);
       importedCount++;
     }
   }
@@ -421,9 +419,10 @@ export function importInvestments(userId, rows) {
 // independent: one failing (unmatched fund, delisted ticker, a flaky
 // network call) never blocks the rest from updating.
 export async function refreshInvestmentPrices(userId) {
-  const investments = listInvestments(userId);
+  const investments = await listInvestments(userId);
   let updatedCount = 0;
   const unmatched = [];
+  const startedAt = Date.now();
 
   for (const inv of investments) {
     try {
@@ -431,9 +430,10 @@ export async function refreshInvestmentPrices(userId) {
         const nav = await fetchMutualFundNav(inv.name);
         if (nav === null) {
           unmatched.push({ id: inv.id, name: inv.name, reason: "No matching AMFI scheme found" });
+          console.warn(`[priceRefresh] user=${userId} mutual_fund "${inv.name}" (${inv.id}): no matching AMFI scheme`);
           continue;
         }
-        updateInvestment(userId, inv.id, { currentPrice: Math.round(nav * 100) });
+        await updateInvestment(userId, inv.id, { currentPrice: Math.round(nav * 100) });
         updatedCount++;
         continue;
       }
@@ -443,24 +443,32 @@ export async function refreshInvestmentPrices(userId) {
         symbol = await resolveStockSymbol(inv.name);
         if (!symbol) {
           unmatched.push({ id: inv.id, name: inv.name, reason: "Could not find a matching ticker symbol" });
+          console.warn(`[priceRefresh] user=${userId} ${inv.type} "${inv.name}" (${inv.id}): no matching ticker symbol`);
           continue;
         }
       }
       const price = await fetchStockPrice(symbol);
       if (price === null) {
         unmatched.push({ id: inv.id, name: inv.name, reason: `No live price available for ${symbol}` });
+        console.warn(`[priceRefresh] user=${userId} ${inv.type} "${inv.name}" (${inv.id}): no live price for symbol ${symbol}`);
         continue;
       }
-      updateInvestment(userId, inv.id, { currentPrice: Math.round(price * 100), symbol });
+      await updateInvestment(userId, inv.id, { currentPrice: Math.round(price * 100), symbol });
       updatedCount++;
     } catch (err) {
-      unmatched.push({ id: inv.id, name: inv.name, reason: err instanceof Error ? err.message : "Price lookup failed" });
+      const reason = err instanceof Error ? err.message : "Price lookup failed";
+      unmatched.push({ id: inv.id, name: inv.name, reason });
+      console.error(`[priceRefresh] user=${userId} ${inv.type} "${inv.name}" (${inv.id}) failed: ${reason}`);
     }
   }
 
+  console.log(
+    `[priceRefresh] user=${userId} done in ${Date.now() - startedAt}ms: ${updatedCount}/${investments.length} updated, ${unmatched.length} unmatched`
+  );
+
   return {
-    investments: listInvestments(userId),
-    summary: getInvestmentSummary(userId),
+    investments: await listInvestments(userId),
+    summary: await getInvestmentSummary(userId),
     updatedCount,
     unmatchedCount: unmatched.length,
     unmatched,

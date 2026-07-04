@@ -14,8 +14,22 @@ import { runDueRecurringPayments } from "./config/recurringDatabase.js";
 
 const app = express();
 const port = process.env.PORT || 3000;
+const allowedOrigins = (process.env.CORS_ORIGIN || process.env.FRONTEND_ORIGIN || "http://localhost:5173")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
 
-app.use(cors());
+app.use(
+  cors({
+    origin(origin, callback) {
+      if (!origin || allowedOrigins.includes(origin)) {
+        callback(null, true);
+        return;
+      }
+      callback(null, false);
+    },
+  })
+);
 // Statement imports are streamed as multipart/form-data (see routes/imports.js),
 // so JSON stays small and is never used as a file transport.
 app.use(express.json({ limit: "1mb" }));
@@ -48,9 +62,7 @@ app.listen(port, "0.0.0.0", () => {
 // or job queue here, so due recurring payments are checked and fired on a
 // simple interval instead.
 setInterval(() => {
-  try {
-    runDueRecurringPayments();
-  } catch (err) {
+  runDueRecurringPayments().catch((err) => {
     console.error("Recurring payment run failed:", err);
-  }
+  });
 }, 60_000);

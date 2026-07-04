@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import type { GroupDetail, UserSearchResult } from '../../api'
 import { addExpense, addGroupMember, formatMoney, generateSettlements, markSettlementPaid, rupeesToPaise } from '../../api'
 import { UserSearchPicker } from './UserSearchPicker'
@@ -37,6 +37,18 @@ export function GroupDetailView({ group, currentUsername, onRefresh, onPaySettle
     () => group.members.reduce((sum, m) => sum + Math.round(Number(customShares[m.username] || '0') * 100), 0),
     [customShares, group.members]
   )
+  const totalSpent = useMemo(() => group.expenses.reduce((sum, expense) => sum + expense.amount, 0), [group.expenses])
+  const yourBalance = group.balances.find((balance) => balance.username === currentUsername)?.netBalance ?? 0
+
+  useEffect(() => {
+    setParticipants((current) => {
+      const currentMembers = new Set(group.members.map((member) => member.username))
+      const next = new Set([...current].filter((username) => currentMembers.has(username)))
+      for (const member of group.members) next.add(member.username)
+      return next
+    })
+    setPaidByUsername((current) => (group.members.some((member) => member.username === current) ? current : currentUsername))
+  }, [currentUsername, group.members])
 
   const toggleParticipant = (username: string) => {
     setParticipants((current) => {
@@ -149,7 +161,30 @@ export function GroupDetailView({ group, currentUsername, onRefresh, onPaySettle
 
   return (
     <>
-      <section className="panel">
+      <section className="panel split-overview-panel">
+        <div className="split-overview-grid">
+          <div className="split-overview-item">
+            <span>Total spent</span>
+            <strong>{formatMoney(totalSpent)}</strong>
+          </div>
+          <div className="split-overview-item">
+            <span>Your position</span>
+            <strong className={yourBalance > 0 ? 'split-positive-text' : yourBalance < 0 ? 'split-negative-text' : ''}>
+              {yourBalance === 0 ? 'Settled' : yourBalance > 0 ? `Owed ${formatMoney(yourBalance)}` : `Owe ${formatMoney(-yourBalance)}`}
+            </strong>
+          </div>
+          <div className="split-overview-item">
+            <span>Pending</span>
+            <strong>{pendingSettlements.length}</strong>
+          </div>
+          <div className="split-overview-item">
+            <span>Members</span>
+            <strong>{group.members.length}</strong>
+          </div>
+        </div>
+      </section>
+
+      <section className="panel split-members-panel">
         <div className="budget-panel-head">
           <div>
             <span className="transfer-section-kicker">Members</span>
@@ -190,7 +225,7 @@ export function GroupDetailView({ group, currentUsername, onRefresh, onPaySettle
         {memberError && <p className="form-error">{memberError}</p>}
       </section>
 
-      <section className="panel">
+      <section className="panel split-expense-panel">
         <div className="budget-panel-head">
           <div>
             <span className="transfer-section-kicker">Add expense</span>
@@ -291,7 +326,7 @@ export function GroupDetailView({ group, currentUsername, onRefresh, onPaySettle
         </div>
       </section>
 
-      <section className="panel">
+      <section className="panel split-history-panel">
         <div className="budget-panel-head">
           <div>
             <span className="transfer-section-kicker">History</span>
@@ -326,7 +361,7 @@ export function GroupDetailView({ group, currentUsername, onRefresh, onPaySettle
         )}
       </section>
 
-      <section className="panel">
+      <section className="panel split-settlements-panel">
         <div className="budget-panel-head">
           <div>
             <span className="transfer-section-kicker">Settle up</span>
@@ -347,11 +382,15 @@ export function GroupDetailView({ group, currentUsername, onRefresh, onPaySettle
           <div className="split-settlement-list">
             {pendingSettlements.map((s) => (
               <div key={s.id} className="split-settlement-row">
-                <span>
+                <span className="split-settlement-copy">
                   <strong>{s.fromUsername === currentUsername ? 'You' : s.fromName}</strong> owe
                   {s.fromUsername === currentUsername ? '' : 's'} <strong>{s.toUsername === currentUsername ? 'you' : s.toName}</strong>{' '}
-                  {formatMoney(s.remainingAmount)}
-                  {s.amountPaid > 0 && <span className="muted"> ({formatMoney(s.amountPaid)} paid of {formatMoney(s.amount)})</span>}
+                  <span className="split-settlement-amount">{formatMoney(s.remainingAmount)}</span>
+                  {s.amountPaid > 0 && (
+                    <span className="muted split-settlement-progress">
+                      {formatMoney(s.amountPaid)} paid of {formatMoney(s.amount)}
+                    </span>
+                  )}
                 </span>
                 <div className="split-settlement-actions">
                   {s.fromUsername === currentUsername && (
@@ -392,7 +431,7 @@ export function GroupDetailView({ group, currentUsername, onRefresh, onPaySettle
           <div className="split-settlement-list split-settlement-list-paid">
             {paidSettlements.map((s) => (
               <div key={s.id} className="split-settlement-row split-settlement-row-paid">
-                <span>
+                <span className="split-settlement-copy">
                   <strong>{s.fromUsername === currentUsername ? 'You' : s.fromName}</strong> paid{' '}
                   <strong>{s.toUsername === currentUsername ? 'you' : s.toName}</strong> {formatMoney(s.amount)}
                 </span>
